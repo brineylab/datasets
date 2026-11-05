@@ -22,7 +22,7 @@ class PushPromoteTests(unittest.TestCase):
         self.branch = "candidate-" + self.tree
         built = self.out / "tiny" / self.tree
         subprocess.run([str(TINY / "recipe" / "build"), str(built)], check=True)
-        (built / ".built").touch(); (built / ".work").mkdir(); (built / ".work" / "source.csv").write_text("staged\n")
+        (built / ".built").write_text("hello@1.0.1\n"); (built / ".work").mkdir(); (built / ".work" / "source.csv").write_text("staged\n")
 
     def run_script(self, *args):
         env = {**os.environ, "HF_TOKEN": "hf_test", "FAKE_HUB": str(self.hub)}
@@ -39,15 +39,21 @@ class PushPromoteTests(unittest.TestCase):
         r = self.run_script("scripts/push", "tiny", self.out)
         self.assertEqual(r.returncode, 0, r.stderr)
         out, s = r.stdout.splitlines(), self.state()
-        self.assertEqual(s["calls"][:3], [["create_repo", "brineylab/tiny"], ["delete_branch", self.branch], ["create_branch", self.branch]])
+        self.assertEqual(s["calls"][:4], [["create_repo", "brineylab/tiny"], ["list_repo_refs", "brineylab/tiny"], ["delete_branch", self.branch], ["create_branch", self.branch]])
         self.assertEqual(out[:2], [f"file eval.txt 6 {self.sha('eval.txt')}", f"file train.txt 18 {self.sha('train.txt')}"])
         self.assertEqual(out[2], f"commit: {s['branches'][self.branch]}"); self.assertRegex(out[2], r"^commit: [0-9a-f]{40}$"); self.assertEqual(len(out), 3)
         self.assertEqual(s["uploaded"], ["eval.txt", "train.txt"])  # neither .built nor .work/
         self.assertIn(["upload_file", "README.md"], s["calls"]); self.assertNotIn("hf_test", r.stdout + r.stderr)
 
-    def test_push_of_a_new_candidate_creates_its_branch(self):
+    def test_push_of_a_new_candidate_creates_its_branch_without_deleting_one(self):
         self.assertEqual(self.run_script("scripts/push", "tiny", self.out).returncode, 0)
-        self.assertEqual([c[0] for c in self.state()["calls"][:3]], ["create_repo", "delete_branch", "create_branch"])
+        self.assertEqual([c[0] for c in self.state()["calls"][:3]], ["create_repo", "list_repo_refs", "create_branch"])
+
+    def test_push_refuses_an_output_built_with_another_tool(self):
+        (self.out / "tiny" / self.tree / ".built").write_text("hello@1.0.0\n")
+        r = self.run_script("scripts/push", "tiny", self.out)
+        self.assertEqual(r.returncode, 1); self.assertIn("was built with hello@1.0.0, not the skill's hello@1.0.1", r.stderr)
+        self.assertFalse(self.hub.exists())
 
     def test_push_refuses_an_output_that_was_not_built(self):
         (self.out / "tiny" / self.tree / ".built").unlink()

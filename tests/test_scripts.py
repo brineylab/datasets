@@ -28,6 +28,21 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1); self.assertIn("datasets/tiny has uncommitted changes", r.stderr)
         self.assertFalse((self.out / "tiny").exists())
 
+    def test_build_refuses_when_git_cannot_say_the_inputs_are_committed(self):
+        shutil.rmtree(self.repo / ".git")
+        r = self.run_script("build", "tiny", self.out)
+        self.assertEqual(r.returncode, 1); self.assertIn("cannot tell whether datasets/tiny is committed", r.stderr)
+        self.assertFalse((self.out / "tiny").exists())
+
+    def test_build_refuses_an_output_built_with_another_tool(self):
+        self.assertEqual(self.run_script("build", "tiny", self.out).returncode, 0)
+        self.assertEqual((self.out / "tiny" / self.tree / ".built").read_text(), "hello@1.0.1\n")
+        skill = self.repo / "datasets/tiny/SKILL.md"
+        skill.write_text(skill.read_text().replace("hello@1.0.1", "hello@1.0.2").replace("version: 1.0.0", "version: 1.0.1"))
+        git(self.repo, "commit", "-qam", "the tool moves")
+        r = self.run_script("build", "tiny", self.out)
+        self.assertEqual(r.returncode, 1); self.assertIn("was built with hello@1.0.1, not the skill's hello@1.0.2", r.stderr)
+
     def test_build_refuses_a_dataset_holding_a_credential_before_running(self):
         (self.repo / "datasets/tiny/recipe/notes").write_text("hf_" + "a" * 34 + "\n")
         git(self.repo, "add", "-A"); git(self.repo, "commit", "-qm", "leak")

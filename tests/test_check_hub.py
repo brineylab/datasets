@@ -64,6 +64,10 @@ class HubTests(unittest.TestCase):
             self.assertIn(f"the record's tree {RECORD['tree']} is not the recipe's {check.tree_hash(d / 'recipe')}; build and test the committed recipe",
                           check.hub_problems(d, RESULTS))
 
+    def test_a_record_of_another_tool_is_refused(self):
+        text = (RESULTS / "tiny" / "1.0.0.txt").read_text().replace("tool: hello@1.0.1", "tool: hello@1.0.0")
+        self.assertIn("the record's tool hello@1.0.0 is not the skill's hello@1.0.1", check.hub_problems(TINY, self.results_with(text)))
+
     def test_a_record_holding_a_credential_is_refused(self):
         text = (RESULTS / "tiny" / "1.0.0.txt").read_text() + "HF_TOKEN=hf_" + "a" * 34 + "\n"
         self.assertIn("results/tiny/1.0.0.txt holds what looks like a credential (hf_)", check.hub_problems(TINY, self.results_with(text)))

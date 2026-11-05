@@ -249,6 +249,8 @@ def hub_problems(dataset_dir: Path, results_dir: Path) -> list[str]:
     rec = parse_record(path)
     if rec["exit"] != 0:
         problems.append(f"the record's exit is {rec['exit']}")
+    if rec.get("tool") != tool:
+        problems.append(f"the record's tool {rec.get('tool')} is not the skill's {tool}")
     tree = tree_hash(dataset_dir / "recipe")
     if rec.get("tree") != tree:
         problems.append(f"the record's tree {rec.get('tree')} is not the recipe's {tree}; build and test the committed recipe")

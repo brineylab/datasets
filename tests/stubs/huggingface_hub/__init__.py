@@ -14,10 +14,12 @@ class CommitInfo:
     def __init__(self, oid): self.oid = oid
 
 class GitRefInfo:
-    def __init__(self, name, target_commit): self.name, self.ref, self.target_commit = name, f"refs/tags/{name}", target_commit
+    def __init__(self, name, ref, target_commit): self.name, self.ref, self.target_commit = name, ref, target_commit
 
 class GitRefs:
-    def __init__(self, tags): self.tags = [GitRefInfo(n, c) for n, c in tags.items()]
+    def __init__(self, branches, tags):
+        self.branches = [GitRefInfo(n, f"refs/heads/{n}", c) for n, c in branches.items()]
+        self.tags = [GitRefInfo(n, f"refs/tags/{n}", c) for n, c in tags.items()]
 
 class HfApi:
     def __init__(self, token=None):
@@ -63,7 +65,7 @@ class HfApi:
         return self._change(["upload_file", path_in_repo], f)
 
     def list_repo_refs(self, repo_id, *, repo_type=None, **kw):
-        return self._change(["list_repo_refs", repo_id], lambda s: GitRefs(s["tags"]))
+        return self._change(["list_repo_refs", repo_id], lambda s: GitRefs(s["branches"], s["tags"]))
 
     def create_tag(self, repo_id, *, tag, revision=None, repo_type=None, **kw):
         def f(s):

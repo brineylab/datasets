@@ -14,7 +14,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check  # noqa: E402
 from huggingface_hub import HfApi  # noqa: E402
-from huggingface_hub.errors import HfHubHTTPError  # noqa: E402
 
 HIDDEN = [".*", "*/.*"]  # fnmatch's * crosses /, so these are every path with a part starting with "."
 
@@ -45,18 +44,20 @@ def main() -> int:
     if not (out / ".built").exists():
         print(f"{out} is not built; run scripts/build {name} {outroot} first", file=sys.stderr)
         return 1
+    meta = check.frontmatter(dataset / "SKILL.md")["metadata"]
+    built = (out / ".built").read_text().strip()
+    if built != meta["tool"]:  # the tool is part of a version's identity, and not of <tree>
+        print(f"{out} was built with {built}, not the skill's {meta['tool']}; remove it and build again", file=sys.stderr)
+        return 1
     if not os.environ.get("HF_TOKEN"):
         print("HF_TOKEN is not set: a Hub token with write access to the org's datasets", file=sys.stderr)
         return 1
-    meta = check.frontmatter(dataset / "SKILL.md")["metadata"]
     repo, branch = f"{check.hub_org()}/{name}", f"candidate-{tree}"
     api = HfApi(token=os.environ["HF_TOKEN"])
     api.create_repo(repo, repo_type="dataset", exist_ok=True)
-    try:  # an earlier candidate of this tree: replaced, so the record's commit holds exactly this output
+    if branch in {b.name for b in api.list_repo_refs(repo, repo_type="dataset").branches}:
+        # an earlier candidate of this tree: replaced, so the record's commit holds exactly this output
         api.delete_branch(repo, branch=branch, repo_type="dataset")
-    except HfHubHTTPError as e:
-        if e.response is None or e.response.status_code != 404:
-            raise
     api.create_branch(repo, branch=branch, revision="main", repo_type="dataset")
     api.upload_folder(folder_path=out, repo_id=repo, repo_type="dataset", revision=branch, ignore_patterns=HIDDEN,
                       commit_message=f"{name} {meta['version']}: the output of recipe tree {tree}")

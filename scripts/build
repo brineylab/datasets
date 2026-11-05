@@ -9,18 +9,26 @@ usage() { echo "usage: scripts/build <name> <outroot> [podman]" >&2; exit 2; }
 name=$1 runner=${3:-}
 mkdir -p "$2"; outroot=$(cd "$2" && pwd)  # podman mounts it, so it is absolute
 cd "$(dirname "$0")/.."
-if [[ -n "$(git status --porcelain --ignored -- "datasets/$name")" ]]; then
+status=$(git status --porcelain --ignored -- "datasets/$name") ||
+  { echo "cannot tell whether datasets/$name is committed: git status failed" >&2; exit 1; }
+if [[ -n "$status" ]]; then
   echo "datasets/$name has uncommitted changes; commit them first" >&2; exit 1
 fi
 python3 -I scripts/check.py "datasets/$name" || exit 1  # its rules, a credential among them, before anything runs
 out=$outroot/$name/$(python3 -I scripts/check.py --tree "datasets/$name")
-if [[ -e "$out/.built" ]]; then echo "built: $out (skipped)"; exit 0; fi
+tool=$(python3 -I -c "import sys; sys.path.insert(0, 'scripts'); import check, pathlib; print(check.frontmatter(pathlib.Path('datasets/$name/SKILL.md'))['metadata']['tool'])")
+if [[ -e "$out/.built" ]]; then
+  # .built names the tool that wrote the output: the tool is part of a version's identity, and not of <tree>
+  [[ "$(cat "$out/.built")" == "$tool" ]] ||
+    { echo "$out was built with $(cat "$out/.built"), not the skill's $tool; remove it and build again" >&2; exit 1; }
+  echo "built: $out (skipped)"; exit 0
+fi
 mkdir -p "$out"
 cmd=("datasets/$name/recipe/build" "$out")
 if [[ $runner == podman ]]; then
-  image=$(python3 -I -c "import sys; sys.path.insert(0, 'scripts'); import check, pathlib; t = check.frontmatter(pathlib.Path('datasets/$name/SKILL.md'))['metadata']['tool']; print(check.toolshed_registry() + '/' + t.replace('@', ':'))")
+  image=$(python3 -I -c "import sys; sys.path.insert(0, 'scripts'); import check; print(check.toolshed_registry())")/${tool/@/:}
   cmd=(podman run --rm --userns=keep-id -v "$PWD":/work -v "$outroot":"$outroot" -w /work "$image" "${cmd[@]}")
 fi
 "${cmd[@]}"
-touch "$out/.built"
+echo "$tool" > "$out/.built"
 echo "built: $out"
