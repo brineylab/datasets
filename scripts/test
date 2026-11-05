@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# scripts/test <name> <outroot> [podman]: run datasets/<name>'s recipe test on what scripts/build wrote,
+# <outroot>/<name>/<tree>/, here or in its tool's image with podman. Passes the test's output through and
+# exits with its code.
+set -euo pipefail
+usage() { echo "usage: scripts/test <name> <outroot> [podman]" >&2; exit 2; }
+[[ $# -eq 2 || ( $# -eq 3 && $3 == podman ) ]] || usage
+name=$1 runner=${3:-}
+[[ -d "$2" ]] && outroot=$(cd "$2" && pwd) || outroot=$2
+cd "$(dirname "$0")/.."
+out=$outroot/$name/$(python3 -I scripts/check.py --tree "datasets/$name")
+[[ -e "$out/.built" ]] || { echo "$out is not built; run scripts/build $name $outroot first" >&2; exit 1; }
+cmd=("datasets/$name/recipe/test" "$out")
+if [[ $runner == podman ]]; then
+  image=$(python3 -I -c "import sys; sys.path.insert(0, 'scripts'); import check, pathlib; t = check.frontmatter(pathlib.Path('datasets/$name/SKILL.md'))['metadata']['tool']; print(check.toolshed_registry() + '/' + t.replace('@', ':'))")
+  cmd=(podman run --rm --userns=keep-id -v "$PWD":/work -v "$outroot":"$outroot" -w /work "$image" "${cmd[@]}")
+fi
+"${cmd[@]}"

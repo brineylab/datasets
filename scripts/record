@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# scripts/record <name> <commit> <exit> <runner> <host> <started> < output: write datasets/<name>'s record,
+# results/<name>/<version>.txt, from a build's output on stdin: the test's lines and scripts/push's `file`
+# and `commit:` lines. A person runs it after scripts/push; so does flyloft, so the format has one owner.
+# Output that holds what looks like a credential is refused: exit 1, and nothing written.
+set -euo pipefail
+usage() { echo "usage: scripts/record <name> <commit> <exit> <runner> <host> <started> < output" >&2; exit 2; }
+[[ $# -eq 6 ]] || usage
+name=$1 commit=$2 code=$3 runner=$4 host=$5 started=$6
+[[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "scripts/record: commit $commit is not forty hex characters" >&2; usage; }
+[[ "$code" =~ ^[0-9]+$ ]] || { echo "scripts/record: exit $code is not a number" >&2; usage; }
+cd "$(dirname "$0")/.."
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT  # the output may hold what record refuses
+cat > "$out"
+python3 -I scripts/check.py --scan "$out" || exit 1  # the record goes public at the merge
+read -r version tool org < <(python3 -I -c "import sys; sys.path.insert(0, 'scripts'); import check, pathlib; m = check.frontmatter(pathlib.Path('datasets/$name/SKILL.md'))['metadata']; print(m['version'], m['tool'], check.hub_org())")
+tree=$(python3 -I scripts/check.py --tree "datasets/$name")
+mkdir -p "results/$name"
+{
+  printf -- '---\n'
+  printf 'dataset: %s\nversion: %s\nhub: %s/%s\nbranch: candidate-%s\n' "$name" "$version" "$org" "$name" "$tree"
+  printf 'commit: %s\ntree: %s\ntool: %s\n' "$commit" "$tree" "$tool"
+  printf 'runner: %s\nhost: %s\nstarted: %s\nexit: %s\n' "$runner" "$host" "$started" "$code"
+  printf -- '---\n'
+  cat "$out"
+} > "results/$name/$version.txt"
+echo "results/$name/$version.txt"
