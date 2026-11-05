@@ -1,0 +1,73 @@
+#!/usr/bin/env -S python3 -I
+"""scripts/push <name> <outroot>: upload what scripts/build wrote, <outroot>/<name>/<tree>/, to the Hub as the
+candidate, the branch candidate-<tree> on <org>/<name>, replacing any earlier one; then the card, README.md,
+from the skill. Prints one `file <path> <size> <sha256>` line per data file and last `commit: <sha>`, the
+branch's head, which scripts/record reads. Paths under a name starting with `.` (.built, a recipe's .work/)
+are neither uploaded nor listed. The token is HF_TOKEN's and is never printed. Runs inside the recipe's tool
+image, which holds huggingface_hub.
+"""
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check  # noqa: E402
+from huggingface_hub import HfApi  # noqa: E402
+from huggingface_hub.errors import HfHubHTTPError  # noqa: E402
+
+HIDDEN = [".*", "*/.*"]  # fnmatch's * crosses /, so these are every path with a part starting with "."
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def card(skill: Path) -> str:
+    """The Hub's README.md: a header with the license and the name, then the skill's body after its frontmatter."""
+    meta = check.frontmatter(skill)
+    body = skill.read_text(encoding="utf-8").split("\n---\n", 1)[1]
+    return f"---\nlicense: {meta['metadata']['license']}\npretty_name: {meta['name']}\n---\n{body}"
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("usage: scripts/push <name> <outroot>", file=sys.stderr)
+        return 2
+    name, outroot = sys.argv[1], Path(sys.argv[2]).resolve()
+    dataset = check.ROOT / "datasets" / name
+    tree = check.tree_hash(dataset / "recipe")
+    out = outroot / name / tree
+    if not (out / ".built").exists():
+        print(f"{out} is not built; run scripts/build {name} {outroot} first", file=sys.stderr)
+        return 1
+    if not os.environ.get("HF_TOKEN"):
+        print("HF_TOKEN is not set: a Hub token with write access to the org's datasets", file=sys.stderr)
+        return 1
+    meta = check.frontmatter(dataset / "SKILL.md")["metadata"]
+    repo, branch = f"{check.hub_org()}/{name}", f"candidate-{tree}"
+    api = HfApi(token=os.environ["HF_TOKEN"])
+    api.create_repo(repo, repo_type="dataset", exist_ok=True)
+    try:  # an earlier candidate of this tree: replaced, so the record's commit holds exactly this output
+        api.delete_branch(repo, branch=branch, repo_type="dataset")
+    except HfHubHTTPError as e:
+        if e.response is None or e.response.status_code != 404:
+            raise
+    api.create_branch(repo, branch=branch, revision="main", repo_type="dataset")
+    api.upload_folder(folder_path=out, repo_id=repo, repo_type="dataset", revision=branch, ignore_patterns=HIDDEN,
+                      commit_message=f"{name} {meta['version']}: the output of recipe tree {tree}")
+    head = api.upload_file(path_or_fileobj=card(dataset / "SKILL.md").encode(), path_in_repo="README.md", repo_id=repo,
+                           repo_type="dataset", revision=branch, commit_message=f"{name} {meta['version']}: the card")
+    files = sorted(p for p in out.rglob("*") if p.is_file() and not any(part.startswith(".") for part in p.relative_to(out).parts))
+    for p in files:
+        print(f"file {p.relative_to(out).as_posix()} {p.stat().st_size} {sha256(p)}")
+    print(f"commit: {head.oid}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

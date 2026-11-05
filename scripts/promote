@@ -1,0 +1,41 @@
+#!/usr/bin/env -S python3 -I
+"""scripts/promote <name> <version>: tag the commit results/<name>/<version>.txt names as v<version> on
+<org>/<name>, then delete the candidate branch. A tag is never moved: one already naming another commit
+exits 1; one already naming the record's commit passes, so a promote run again after it succeeded passes.
+The last line of stdout says what happened. The token is HF_TOKEN's. CI runs it on a push to main.
+"""
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check  # noqa: E402
+from huggingface_hub import HfApi  # noqa: E402
+from huggingface_hub.errors import HfHubHTTPError  # noqa: E402
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("usage: scripts/promote <name> <version>", file=sys.stderr)
+        return 2
+    name, version = sys.argv[1:]
+    rec = check.parse_record(check.ROOT / "results" / name / f"{version}.txt")
+    repo, tag, commit = f"{check.hub_org()}/{name}", f"v{version}", rec["commit"]
+    api = HfApi(token=os.environ["HF_TOKEN"])
+    have = {t.name: t.target_commit for t in api.list_repo_refs(repo, repo_type="dataset").tags}
+    if tag in have and have[tag] != commit:
+        print(f"{repo} {tag} already exists at {have[tag]}, not the record's {commit}; a published tag is never moved", file=sys.stderr)
+        return 1
+    if tag not in have:
+        api.create_tag(repo, tag=tag, revision=commit, repo_type="dataset")
+    try:
+        api.delete_branch(repo, branch=rec["branch"], repo_type="dataset")
+    except HfHubHTTPError as e:
+        if e.response is None or e.response.status_code != 404:
+            raise
+    print(f"promoted: {repo} {tag} at {commit}" if tag not in have else f"{repo} {tag} already promoted at {commit}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
