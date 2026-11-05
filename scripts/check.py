@@ -1,6 +1,7 @@
 """A dataset directory's rules, its recipe tree, its record, and whether its version is published.
 
     python3 -I scripts/check.py datasets/<name>              the directory's rules; exit 1, one line per reason, on any
+    python3 -I scripts/check.py --hub datasets/<name>        the rules, then the version, the tool, and the record against the Hub
     python3 -I scripts/check.py --tree datasets/<name>       prints git's tree hash of datasets/<name>/recipe/
     python3 -I scripts/check.py --candidate datasets/<name>  prints candidate-<tree>, the Hub branch a build is pushed to
     python3 -I scripts/check.py --scan FILE                  exits 1, naming each shape, when FILE holds what looks like a credential
@@ -16,6 +17,8 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,11 +43,15 @@ def unquote(value: str) -> str:
 
 
 def frontmatter(path: Path) -> dict:
+    return frontmatter_of(path.read_text(encoding="utf-8-sig", errors="replace"))
+
+
+def frontmatter_of(text: str) -> dict:
     """The first `---` block: `key: value` lines, and `key:` opening a dict of two-space-indented lines.
 
     One pair of matching quotes around a value is removed. {} when there is no block.
     """
-    lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    lines = text.lstrip("\ufeff").splitlines()
     if not lines or lines[0].strip() != "---":
         return {}
     out, nested = {}, None
@@ -174,10 +181,102 @@ def rules(dataset_dir: Path) -> list[str]:
     return reasons
 
 
+def fetch(url: str) -> bytes | None:
+    """The body of a public GET, with no credential; None when the server answers 401 or 404, which is
+    how the Hub answers a missing repository and a missing revision."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "datasets-check"})) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 404):
+            return None
+        raise
+
+
+def hub_get(url: str) -> object:
+    body = fetch(url)
+    return None if body is None else json.loads(body)
+
+
+def shed_catalogue() -> set[str]:
+    """name@version of every tool on the toolshed's main, the shed being hub.toml's registry path."""
+    shed = toolshed_registry().split("/", 1)[1]
+    tools = hub_get(f"https://api.github.com/repos/{shed}/contents/tools") or []
+    out = set()
+    for t in tools:
+        if t.get("type") != "dir":
+            continue
+        skill = fetch(f"https://raw.githubusercontent.com/{shed}/main/tools/{t['name']}/SKILL.md")
+        meta = frontmatter_of(skill.decode("utf-8", "replace")) if skill else {}
+        version = meta.get("metadata", {}).get("version") if isinstance(meta.get("metadata"), dict) else None
+        if version:
+            out.add(f"{t['name']}@{version}")
+    return out
+
+
+FILE = re.compile(r"^file (\S+) (\d+) ([0-9a-f]{64})$")
+
+
+def parse_record(path: Path) -> dict:
+    """The record's header fields, `exit` as an int, and `files`: (path, size, sha256) of each `file` line, in order."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    rec = frontmatter_of(text)
+    rec["exit"] = int(rec["exit"]) if rec.get("exit", "").isdigit() else rec.get("exit")
+    body = text.split("\n---\n", 1)[1] if "\n---\n" in text else ""
+    rec["files"] = [(m.group(1), int(m.group(2)), m.group(3)) for m in map(FILE.match, body.splitlines()) if m]
+    return rec
+
+
+def hub_problems(dataset_dir: Path, results_dir: Path) -> list[str]:
+    """The reasons this dataset's version cannot be published: its tag exists, its tool is not in the shed,
+    or its record is missing, failed, of another recipe, or names files the Hub does not hold exactly."""
+    name = dataset_dir.name
+    meta = frontmatter(dataset_dir / "SKILL.md")["metadata"]
+    version, tool, repo = meta["version"], meta["tool"], f"{hub_org()}/{name}"
+    api, problems = f"https://huggingface.co/api/datasets/{repo}", []
+    refs = hub_get(f"{api}/refs") or {}
+    if f"v{version}" in {t["name"] for t in refs.get("tags", [])}:
+        problems.append(f"v{version} is already on the Hub")
+    if tool not in shed_catalogue():
+        problems.append(f"{tool} is not in the toolshed")
+    rel = f"results/{name}/{version}.txt"
+    path = results_dir / name / f"{version}.txt"
+    if not path.is_file():
+        return problems + [f"{rel} is missing"]
+    found = scan(path.read_text(encoding="utf-8", errors="replace"))
+    if found:
+        problems.append(f"{rel} holds what looks like a credential ({', '.join(found)})")
+    rec = parse_record(path)
+    if rec["exit"] != 0:
+        problems.append(f"the record's exit is {rec['exit']}")
+    tree = tree_hash(dataset_dir / "recipe")
+    if rec.get("tree") != tree:
+        problems.append(f"the record's tree {rec.get('tree')} is not the recipe's {tree}; build and test the committed recipe")
+    commit = rec.get("commit", "")
+    # ponytail: one page of the tree (1000 files); a longer listing reads as files missing, add the Link header's pages then
+    listing = hub_get(f"{api}/tree/{commit}?recursive=true") if re.match(r"^[0-9a-f]{40}$", commit) else None
+    if listing is None:
+        return problems + [f"the record's commit {commit} is not on {repo}"]
+    hub = {f["path"]: (f["size"], f.get("lfs", {}).get("oid")) for f in listing
+           if f.get("type") == "file" and f["path"] not in ("README.md", ".gitattributes")}  # the card and the Hub's own
+    recorded = {p: (size, sha) for p, size, sha in rec["files"]}
+    for p in sorted(set(hub) | set(recorded)):
+        if p not in hub:
+            problems.append(f"{p} is not on the Hub")
+        elif p not in recorded:
+            problems.append(f"{p} is not in the record")
+        elif hub[p][1] is None:
+            problems.append(f"{p} is not in LFS on the Hub, so its sha256 cannot be checked")
+        elif hub[p] != recorded[p]:
+            problems.append(f"{p} differs from the Hub")
+    return problems
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     one = p.add_mutually_exclusive_group(required=True)
     one.add_argument("dataset", nargs="?", type=Path)
+    one.add_argument("--hub", type=Path, metavar="DATASET_DIR")
     one.add_argument("--tree", type=Path, metavar="DATASET_DIR")
     one.add_argument("--candidate", type=Path, metavar="DATASET_DIR")
     one.add_argument("--scan", type=Path, metavar="FILE")
@@ -191,9 +290,12 @@ def main() -> int:
         tree = tree_hash((args.tree or args.candidate) / "recipe")
         print(tree if args.tree else f"candidate-{tree}")
         return 0
-    reasons = rules(args.dataset)
+    d = args.dataset or args.hub
+    reasons = rules(d)
+    if args.hub and not reasons:  # the shed and the Hub are asked only about a directory that keeps the rules
+        reasons = hub_problems(d, d.resolve().parents[1] / "results")
     for reason in reasons:
-        print(f"datasets/{args.dataset.name}: {reason}")
+        print(f"datasets/{d.name}: {reason}")
     return 1 if reasons else 0
 
 

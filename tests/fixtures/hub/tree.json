@@ -1,0 +1,6 @@
+[
+  {"type": "file", "oid": "957b2579c6ef20995a09efd9a17f8fd90606f5ed", "size": 1174, "path": ".gitattributes"},
+  {"type": "file", "oid": "9efdff48906733be2fa05e4538f017d2fbec7afc", "size": 412, "path": "README.md"},
+  {"type": "file", "oid": "04b6b4192a027d01d8f6ae9d949fadc4eac3c2d2", "size": 6, "lfs": {"oid": "1c591ec0ff158dfd9f70ad8e5a82de5badb02e83821831dbbbdd6d94de448fc5", "size": 6, "pointerSize": 128}, "path": "eval.txt"},
+  {"type": "file", "oid": "f79b44767fc4671bbe0f47437eb9ad5f30c7f18a", "size": 18, "lfs": {"oid": "ddd3137e7e734e243c666afd5617905b511683a3d45fe49965caf1f612608191", "size": 18, "pointerSize": 129}, "path": "train.txt"}
+]

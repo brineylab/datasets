@@ -1,0 +1,17 @@
+---
+dataset: tiny
+version: 1.0.0
+hub: brineylab/tiny
+branch: candidate-f24257113b44aa72093327b7afbfc118854266e7
+commit: 1f0e3d2c1b0a99887766554433221100ffeeddcc
+tree: f24257113b44aa72093327b7afbfc118854266e7
+tool: hello@1.0.1
+runner: podman
+host: laptop
+started: 2026-11-05T00:00:00Z
+exit: 0
+---
+train.txt 3 rows, eval.txt 1 row
+file eval.txt 6 1c591ec0ff158dfd9f70ad8e5a82de5badb02e83821831dbbbdd6d94de448fc5
+file train.txt 18 ddd3137e7e734e243c666afd5617905b511683a3d45fe49965caf1f612608191
+commit: 1f0e3d2c1b0a99887766554433221100ffeeddcc

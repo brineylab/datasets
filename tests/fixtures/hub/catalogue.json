@@ -1,0 +1,4 @@
+[
+  {"name": "README.md", "path": "tools/README.md", "type": "file"},
+  {"name": "hello", "path": "tools/hello", "type": "dir"}
+]

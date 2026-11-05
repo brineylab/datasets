@@ -1,0 +1,1 @@
+{"branches": [{"name": "main", "ref": "refs/heads/main", "targetCommit": "0123456789abcdef0123456789abcdef01234567"}, {"name": "candidate-f24257113b44aa72093327b7afbfc118854266e7", "ref": "refs/heads/candidate-f24257113b44aa72093327b7afbfc118854266e7", "targetCommit": "1f0e3d2c1b0a99887766554433221100ffeeddcc"}], "tags": []}

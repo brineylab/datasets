@@ -1,7 +1,8 @@
 name: datasets
 
 # On GitHub's hosted runners only. This never builds, tests, or pulls a dataset. check: every pull
-# request, the scripts' unit tests and the changed datasets' rules.
+# request, the scripts' unit tests and, for each changed dataset, its rules, a version not yet on
+# the Hub, its tool in the toolshed, and a passing record whose files the Hub holds exactly.
 
 on:
   pull_request:
@@ -28,5 +29,5 @@ jobs:
           datasets=$(scripts/changed-datasets "origin/$BASE_REF...HEAD")
           [[ -n "$datasets" ]] || { echo "no dataset changed"; exit 0; }
           failed=0
-          for d in $datasets; do python3 -I scripts/check.py "datasets/$d" || failed=1; done
+          for d in $datasets; do python3 -I scripts/check.py --hub "datasets/$d" || failed=1; done
           exit "$failed"
