@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# recipe/test <out>: exit 0 iff train.txt has three lines and eval.txt one.
+set -euo pipefail
+[[ -f "$1/train.txt" && -f "$1/eval.txt" ]] || { echo "train.txt or eval.txt is missing"; exit 1; }
+[[ $(wc -l < "$1/train.txt") -eq 3 && $(wc -l < "$1/eval.txt") -eq 1 ]] || { echo "the row counts are wrong"; exit 1; }
+echo "train.txt 3 rows, eval.txt 1 row"

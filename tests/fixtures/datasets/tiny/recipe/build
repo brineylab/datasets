@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# recipe/build <out>: three lines of train.txt and one of eval.txt.
+set -euo pipefail
+mkdir -p "$1"
+printf 'pair1\npair2\npair3\n' > "$1/train.txt"
+printf 'pair4\n' > "$1/eval.txt"
