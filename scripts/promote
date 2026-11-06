@@ -2,7 +2,8 @@
 """scripts/promote <name> <version>: tag the commit results/<name>/<version>.txt names as v<version> on
 <org>/<name>, then delete the candidate branch. Whoever merges the dataset's pull request runs it after
 pulling main, with their own HF_TOKEN; a record that is not on origin/main as it is here is refused, so only
-a reviewed, merged record is published. A tag is never moved: one already naming another commit exits 1;
+a reviewed, merged record is published (a guard against mistakes, not misuse: an org token can tag
+the Hub directly). Run it from a full clone: a worktree's .git points outside a mounted directory. A tag is never moved: one already naming another commit exits 1;
 one already naming the record's commit passes, so a promote run again after it succeeded passes. The last
 line of stdout says what happened.
 """
@@ -24,8 +25,10 @@ def main() -> int:
     name, version = sys.argv[1:]
     rel = f"results/{name}/{version}.txt"
     merged = subprocess.run(["git", "show", f"origin/main:{rel}"], cwd=check.ROOT, capture_output=True)
-    if merged.returncode or merged.stdout != (check.ROOT / rel).read_bytes():
-        print(f"{rel} is not on origin/main; merge its pull request and pull first", file=sys.stderr)
+    here = check.ROOT / rel
+    if merged.returncode or not here.is_file() or merged.stdout != here.read_bytes():
+        why = f" ({merged.stderr.decode(errors='replace').strip()})" if merged.returncode else ""
+        print(f"{rel} is not on origin/main{why}; merge its pull request and pull first, in a full clone", file=sys.stderr)
         return 1
     rec = check.parse_record(check.ROOT / rel)
     repo, tag, commit = f"{check.hub_org()}/{name}", f"v{version}", rec["commit"]

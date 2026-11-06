@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> Tasks 5–7 are replaced by `datasets-a2.md`; Task 8 waits for flyloft's plan B.
+> Tasks 5–7 are replaced by `datasets-a2.md`; Task 8 waits for flyloft's plan B. DESIGN's 2026-11-06 revision supersedes this plan's `promote` job and its `HF_TOKEN` repository secret: whoever merges runs `scripts/promote` with their own token, and CI holds none.
 
 **Goal:** The lab's datasets repository exists as `brineylab/datasets`, with its check script, the contributor's build, test, push, record, and promote scripts, a workflow that checks a pull request's record against the Hub and promotes on merge, a recipe image in the toolshed, and two datasets published to the Hub under `brineylab`: `hello`, a synthetic one of kilobytes that exercises the whole path, and `oas-paired-human`, the real one.
 

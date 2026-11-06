@@ -52,7 +52,7 @@ datasets/<name>/recipe/build <out> && datasets/<name>/recipe/test <out> && pytho
 
 ## Rules the repository keeps
 
-- `scripts/check.py` and `scripts/record` run with the Python standard library alone (`python3 -I`): flyloft's host runs them, and so do login nodes. `scripts/push` and `scripts/promote` need `huggingface_hub`, which `datascience` and CI have.
+- `scripts/check.py` and `scripts/record` run with the Python standard library alone (`python3 -I`): flyloft's host runs them, and so do login nodes. `scripts/push` and `scripts/promote` need `huggingface_hub`, which `datascience` has.
 - Nothing in `scripts/` or `.github/` names the lab: the org comes from `hub.toml`, so a fork with its own org is its own catalogue and store.
 - CI runs on hosted runners and never runs a recipe or pulls a dataset. Whoever cooks a dataset tests its output where it was built, files it with `scripts/push`, and commits the record; nobody can claim a version exists without one.
 - Every dataset is reviewed by someone other than its builder before it merges.

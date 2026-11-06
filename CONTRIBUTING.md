@@ -110,4 +110,4 @@ Any change under `datasets/<name>/` bumps `metadata.version`, prose included. A 
      ghcr.io/brineylab/toolshed/datascience:1.0.0 python3 -I scripts/promote <name> <version>
    ```
 
-   It tags the record's commit `v<version>` on the Hub and deletes the candidate branch; its last line says what it did. It refuses a record that is not on `origin/main`. CI holds no Hub token, so nothing is published until someone runs it.
+   It tags the record's commit `v<version>` on the Hub and deletes the candidate branch; its last line says what it did. It refuses a record that is not on `origin/main`. Run it from a full clone, not a `git worktree`, whose `.git` points outside the mounted directory. CI holds no Hub token, so nothing is published until someone runs it.
