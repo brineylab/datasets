@@ -5,7 +5,7 @@ hub: brineylab/tiny
 branch: candidate-f24257113b44aa72093327b7afbfc118854266e7
 commit: 1f0e3d2c1b0a99887766554433221100ffeeddcc
 tree: f24257113b44aa72093327b7afbfc118854266e7
-tool: hello@1.0.1
+tools: hello@1.0.1
 runner: podman
 host: laptop
 started: 2026-11-05T00:00:00Z

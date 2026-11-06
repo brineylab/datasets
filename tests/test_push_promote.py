@@ -8,7 +8,8 @@ STUBS = ROOT / "tests" / "stubs"
 LAUNCH = "import runpy, sys; sys.path.insert(0, sys.argv[1]); sys.argv = sys.argv[2:]; runpy.run_path(sys.argv[0], run_name='__main__')"
 
 class PushPromoteTests(unittest.TestCase):
-    """The real scripts in a temporary repository holding the tiny fixture, built; the Hub is the fake's JSON file."""
+    """The real scripts in a temporary repository holding the tiny fixture, and the recipe's output in a plain directory;
+    the Hub is the fake's JSON file."""
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.tmp)
         self.repo, self.out, self.hub = self.tmp / "repo", self.tmp / "out", self.tmp / "hub.json"
@@ -20,9 +21,8 @@ class PushPromoteTests(unittest.TestCase):
         git(self.repo, "init", "-q"); git(self.repo, "add", "-A"); git(self.repo, "commit", "-qm", "tiny")
         self.tree = check.tree_hash(self.repo / "datasets/tiny/recipe")
         self.branch = "candidate-" + self.tree
-        built = self.out / "tiny" / self.tree
-        subprocess.run([str(TINY / "recipe" / "build"), str(built)], check=True)
-        (built / ".built").write_text("hello@1.0.1\n"); (built / ".work").mkdir(); (built / ".work" / "source.csv").write_text("staged\n")
+        subprocess.run([str(TINY / "recipe" / "build"), str(self.out)], check=True)
+        (self.out / ".work").mkdir(); (self.out / ".work" / "source.csv").write_text("staged\n")
 
     def run_script(self, *args):
         env = {**os.environ, "HF_TOKEN": "hf_test", "FAKE_HUB": str(self.hub)}
@@ -32,7 +32,7 @@ class PushPromoteTests(unittest.TestCase):
         return json.loads(self.hub.read_text())
 
     def sha(self, name):
-        return hashlib.sha256((self.out / "tiny" / self.tree / name).read_bytes()).hexdigest()
+        return hashlib.sha256((self.out / name).read_bytes()).hexdigest()
 
     def test_push_creates_the_repo_replaces_the_candidate_and_prints_the_manifest(self):
         self.hub.write_text(json.dumps({"branches": {"main": "m" * 40, self.branch: "old"}}))
@@ -42,23 +42,54 @@ class PushPromoteTests(unittest.TestCase):
         self.assertEqual(s["calls"][:4], [["create_repo", "brineylab/tiny"], ["list_repo_refs", "brineylab/tiny"], ["delete_branch", self.branch], ["create_branch", self.branch]])
         self.assertEqual(out[:2], [f"file eval.txt 6 {self.sha('eval.txt')}", f"file train.txt 18 {self.sha('train.txt')}"])
         self.assertEqual(out[2], f"commit: {s['branches'][self.branch]}"); self.assertRegex(out[2], r"^commit: [0-9a-f]{40}$"); self.assertEqual(len(out), 3)
-        self.assertEqual(s["uploaded"], ["eval.txt", "train.txt"])  # neither .built nor .work/
+        self.assertEqual(s["uploaded"], ["eval.txt", "train.txt"])  # not .work/
         self.assertIn(["upload_file", "README.md"], s["calls"]); self.assertNotIn("hf_test", r.stdout + r.stderr)
 
     def test_push_of_a_new_candidate_creates_its_branch_without_deleting_one(self):
         self.assertEqual(self.run_script("scripts/push", "tiny", self.out).returncode, 0)
         self.assertEqual([c[0] for c in self.state()["calls"][:3]], ["create_repo", "list_repo_refs", "create_branch"])
 
-    def test_push_refuses_an_output_built_with_another_tool(self):
-        (self.out / "tiny" / self.tree / ".built").write_text("hello@1.0.0\n")
+    def test_push_names_the_candidate_by_the_committed_tree(self):
+        self.assertEqual(self.run_script("scripts/push", "tiny", self.out).returncode, 0)
+        committed = git(self.repo, "rev-parse", "HEAD:datasets/tiny/recipe").strip()
+        self.assertEqual(self.state()["calls"][2], ["create_branch", "candidate-" + committed])
+
+    def refused(self, *args):
+        r = self.run_script("scripts/push", "tiny", *args)
+        self.assertEqual(r.returncode, 1, r.stdout); self.assertFalse(self.hub.exists())  # no call reached the Hub
+        return r.stderr + r.stdout
+
+    def test_push_refuses_uncommitted_changes(self):
+        with open(self.repo / "datasets/tiny/recipe/params.toml", "a") as f: f.write("more = 2\n")
+        self.assertIn("datasets/tiny has uncommitted changes; commit them first", self.refused(self.out))
+
+    def test_push_refuses_an_ignored_file_in_the_recipe(self):
+        (self.repo / ".gitignore").write_text("*.tmp\n"); git(self.repo, "add", ".gitignore"); git(self.repo, "commit", "-qm", "ignore")
+        (self.repo / "datasets/tiny/recipe/x.tmp").write_text("x\n")
+        self.assertIn("datasets/tiny has uncommitted changes; commit them first", self.refused(self.out))
+
+    def test_push_refuses_an_untracked_file_a_users_git_config_hides(self):
+        git(self.repo, "config", "status.showUntrackedFiles", "no")
+        (self.repo / "datasets/tiny/recipe/extra").write_text("x\n")
+        self.assertIn("datasets/tiny has uncommitted changes; commit them first", self.refused(self.out))
+
+    def test_push_refuses_when_git_cannot_say_the_inputs_are_committed(self):
+        shutil.rmtree(self.repo / ".git")
         r = self.run_script("scripts/push", "tiny", self.out)
-        self.assertEqual(r.returncode, 1); self.assertIn("was built with hello@1.0.0, not the skill's hello@1.0.1", r.stderr)
+        self.assertEqual(r.returncode, 1); self.assertTrue(r.stderr.startswith("cannot tell whether datasets/tiny is committed:"), r.stderr)
         self.assertFalse(self.hub.exists())
 
-    def test_push_refuses_an_output_that_was_not_built(self):
-        (self.out / "tiny" / self.tree / ".built").unlink()
-        r = self.run_script("scripts/push", "tiny", self.out)
-        self.assertEqual(r.returncode, 1); self.assertIn("is not built", r.stderr); self.assertFalse(self.hub.exists())
+    def test_push_refuses_a_skill_holding_a_credential(self):
+        skill = self.repo / "datasets/tiny/SKILL.md"
+        skill.write_text(skill.read_text() + "\nhf_" + "a" * 34 + "\n"); git(self.repo, "commit", "-qam", "leak")
+        self.assertIn("SKILL.md holds what looks like a credential (hf_)", self.refused(self.out))
+
+    def test_push_refuses_an_output_with_no_files(self):
+        empty, missing = self.tmp / "empty", self.tmp / "missing"
+        empty.mkdir(); (empty / ".work").mkdir(); (empty / ".work" / "x").write_text("x\n")  # hidden files are not data
+        for path in (empty, missing):
+            with self.subTest(path=path):
+                self.assertIn(f"{path} holds no files to push", self.refused(path))
 
     def test_the_card_carries_the_license_and_the_skills_body(self):
         self.run_script("scripts/push", "tiny", self.out)

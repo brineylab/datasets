@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> Tasks 5–7 are replaced by `datasets-a2.md`; Task 8 waits for flyloft's plan B.
+
 **Goal:** The lab's datasets repository exists as `brineylab/datasets`, with its check script, the contributor's build, test, push, record, and promote scripts, a workflow that checks a pull request's record against the Hub and promotes on merge, a recipe image in the toolshed, and two datasets published to the Hub under `brineylab`: `hello`, a synthetic one of kilobytes that exercises the whole path, and `oas-paired-human`, the real one.
 
 **Architecture:** One directory per dataset holds a skill, a recipe (one program plus its parameters), and the recipe's test; the bytes live on the Hub as a tag per version. `scripts/check.py` and `scripts/record` are Python standard library only, because flyloft's host and the clusters' login nodes run them; `scripts/push` and `scripts/promote` use `huggingface_hub` and run inside the recipe's tool image or in CI. The candidate is a Hub branch named by the recipe tree's git hash; the record on the pull request names the candidate's commit and the files with their sha256, and `check` proves the Hub holds exactly those. Everything mirrors the toolshed ([brineylab/toolshed](https://github.com/brineylab/toolshed)); read its `scripts/` before writing the same thing here.

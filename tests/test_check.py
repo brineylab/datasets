@@ -5,7 +5,18 @@ import check  # noqa: E402
 class CheckTests(unittest.TestCase):
     def test_frontmatter_reads_the_five_fields(self):
         fm = check.frontmatter(TINY / "SKILL.md")
-        self.assertEqual((fm["name"], fm["metadata"]["version"], fm["metadata"]["tool"], fm["metadata"]["license"]), ("tiny", "1.0.0", "hello@1.0.1", "mit"))
+        self.assertEqual((fm["name"], fm["metadata"]["version"], fm["metadata"]["tools"], fm["metadata"]["license"]), ("tiny", "1.0.0", "hello@1.0.1", "mit"))
+
+    def test_two_tools_separated_by_a_space_pass(self):
+        with copy_of(TINY) as d:
+            skill = d / "SKILL.md"; skill.write_text(skill.read_text().replace("tools: hello@1.0.1", "tools: hello@1.0.1 datascience@1.0.0"))
+            self.assertEqual(check.rules(d), [])
+
+    def test_a_malformed_tools_list_is_refused(self):
+        for value in ("hello@1.0.1,datascience@1.0.0", "hello@1.0.1  datascience@1.0.0", ""):
+            with self.subTest(value=value), copy_of(TINY) as d:
+                skill = d / "SKILL.md"; skill.write_text(skill.read_text().replace("tools: hello@1.0.1", f'tools: "{value}"'))
+                self.assertIn(f"tools {value!r} is not one or more toolshed tools' name@MAJOR.MINOR.PATCH separated by single spaces", check.rules(d))
 
     def test_rules_pass_on_the_fixture_and_name_each_defect(self):
         self.assertEqual(check.rules(TINY), [])

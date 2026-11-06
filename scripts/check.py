@@ -1,7 +1,7 @@
 """A dataset directory's rules, its recipe tree, its record, and whether its version is published.
 
     python3 -I scripts/check.py datasets/<name>              the directory's rules; exit 1, one line per reason, on any
-    python3 -I scripts/check.py --hub datasets/<name>        the rules, then the version, the tool, and the record against the Hub
+    python3 -I scripts/check.py --hub datasets/<name>        the rules, then the version, the tools, and the record against the Hub
     python3 -I scripts/check.py --tree datasets/<name>       prints git's tree hash of datasets/<name>/recipe/
     python3 -I scripts/check.py --candidate datasets/<name>  prints candidate-<tree>, the Hub branch a build is pushed to
     python3 -I scripts/check.py --scan FILE                  exits 1, naming each shape, when FILE holds what looks like a credential
@@ -156,8 +156,9 @@ def rules(dataset_dir: Path) -> list[str]:
             reasons.append("description is empty")
         if not VERSION.match(meta.get("version", "")):
             reasons.append(f"version {meta.get('version')!r} is not MAJOR.MINOR.PATCH")
-        if not TOOL.match(meta.get("tool", "")):
-            reasons.append(f"tool {meta.get('tool')!r} is not a toolshed tool's name@MAJOR.MINOR.PATCH")
+        tools = meta.get("tools", "")
+        if not tools or not all(TOOL.match(t) for t in tools.split(" ")):
+            reasons.append(f"tools {tools!r} is not one or more toolshed tools' name@MAJOR.MINOR.PATCH separated by single spaces")
         if not meta.get("license"):
             reasons.append("license is empty")
     for script in ("recipe/build", "recipe/test"):
@@ -228,17 +229,17 @@ def parse_record(path: Path) -> dict:
 
 
 def hub_problems(dataset_dir: Path, results_dir: Path) -> list[str]:
-    """The reasons this dataset's version cannot be published: its tag exists, its tool is not in the shed,
+    """The reasons this dataset's version cannot be published: its tag exists, a tool is not in the shed,
     or its record is missing, failed, of another recipe, or names files the Hub does not hold exactly."""
     name = dataset_dir.name
     meta = frontmatter(dataset_dir / "SKILL.md")["metadata"]
-    version, tool, repo = meta["version"], meta["tool"], f"{hub_org()}/{name}"
+    version, tools, repo = meta["version"], meta["tools"], f"{hub_org()}/{name}"
     api, problems = f"https://huggingface.co/api/datasets/{repo}", []
     refs = hub_get(f"{api}/refs") or {}
     if f"v{version}" in {t["name"] for t in refs.get("tags", [])}:
         problems.append(f"v{version} is already on the Hub")
-    if tool not in shed_catalogue():
-        problems.append(f"{tool} is not in the toolshed")
+    shed = shed_catalogue()
+    problems += [f"{t} is not in the toolshed" for t in tools.split(" ") if t not in shed]
     rel = f"results/{name}/{version}.txt"
     path = results_dir / name / f"{version}.txt"
     if not path.is_file():
@@ -249,8 +250,8 @@ def hub_problems(dataset_dir: Path, results_dir: Path) -> list[str]:
     rec = parse_record(path)
     if rec["exit"] != 0:
         problems.append(f"the record's exit is {rec['exit']}")
-    if rec.get("tool") != tool:
-        problems.append(f"the record's tool {rec.get('tool')} is not the skill's {tool}")
+    if rec.get("tools") != tools:
+        problems.append(f"the record's tools {rec.get('tools')} is not the skill's {tools}")
     tree = tree_hash(dataset_dir / "recipe")
     if rec.get("tree") != tree:
         problems.append(f"the record's tree {rec.get('tree')} is not the recipe's {tree}; build and test the committed recipe")

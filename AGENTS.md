@@ -6,7 +6,7 @@ Read before changing anything:
 
 - `docs/VISION.md`: what the repository is for and what it is not.
 - `docs/DESIGN.md`: what a dataset is, the repository, the workflow, review; and what flyloft needs from here.
-- `docs/plans/datasets-a.md`: the plan that builds the repository. Work it task by task; its Global Constraints are binding.
+- `docs/plans/datasets-a.md`: the plan that built the repository, and `docs/plans/datasets-a2.md`, which revises it. Work them task by task; their Global Constraints are binding.
 - `CONTRIBUTING.md`, once it exists: how to add a dataset, step by step. The rules below are the binding summary.
 
 `docs/VISION.md` and `docs/DESIGN.md` are approved by the lab. Do not edit them unless asked to. If the work shows the design is wrong, stop and say so.
@@ -17,18 +17,16 @@ This repository mirrors the toolshed ([brineylab/toolshed](https://github.com/br
 
 ```
 datasets/<name>/SKILL.md          the skill: what the dataset is, its files, the line that loads it, its recipe, its compute
-datasets/<name>/recipe/build      the recipe: reads params.toml beside it, writes the version's files into its argument
+datasets/<name>/recipe/build      the recipe's program (a split recipe's first): reads params.toml beside it, writes the version's files into its argument
 datasets/<name>/recipe/params.toml
 datasets/<name>/recipe/test       checks an output directory is a version; exit 0 iff it is
 results/<name>/<version>.txt      the record of a candidate's test
 hub.toml                          the Hub org this repository publishes to
 scripts/check.py                  a dataset directory's rules, its record, and whether its version is published
-scripts/build <name> <outroot> [podman]   run the recipe into <outroot>/<name>/<tree>/, or skip when already built
-scripts/test <name> <outroot> [podman]    the recipe's test on that output
-scripts/push <name> <outroot>             upload the output and the card to the Hub's candidate branch; prints the manifest and `commit:`
-scripts/record <name> <commit> <exit> <runner> <host> <started> < output   write a record from a build's output
+scripts/push <name> <output dir>          upload the cook's output and the card to the Hub's candidate branch; prints the manifest and `commit:`
+scripts/record <name> <commit> <exit> <runner> <host> <started> < output   write a record from the test's and push's output
 scripts/promote <name> <version>          tag the record's commit on the Hub, never moving a tag; delete the candidate branch
-tests/                            unit tests of the scripts, with the Hub, podman, and srun stubbed
+tests/                            unit tests of the scripts, with the Hub stubbed
 .github/workflows/datasets.yml    check and promote, on hosted runners
 ```
 
@@ -37,27 +35,26 @@ tests/                            unit tests of the scripts, with the Hub, podma
 ```bash
 python3 -I -m unittest discover tests                 # the scripts' unit tests: the only tests this repository has
 python3 -I scripts/check.py datasets/<name>           # a dataset's rules; add --hub to check its version, candidate, and record against the Hub
-scripts/build <name> <outroot> && scripts/test <name> <outroot> && scripts/push <name> <outroot>   # inside the recipe's tool image
-scripts/build <name> <outroot> podman                 # on a laptop, wrapping the recipe in `podman run` of its tool image
+datasets/<name>/recipe/build <out> && datasets/<name>/recipe/test <out> && python3 -I scripts/push <name> <out>   # inside the recipe's tool image, as CONTRIBUTING.md writes out
 ```
 
 ## Rules a dataset must keep
 
 - **The bytes are on the Hub, never in git.** A version is a tag `v<version>` on `<org>/<name>`; its files are parquet (sharded when large), under 200 GB each, under 100k files.
-- **A recipe is one program** that reads `recipe/params.toml` and writes a version's files into one directory. It names no runtime: it runs inside its tool's image, under `srun` on a cluster or `podman run` on a laptop.
-- **The recipe's tool is a toolshed tool**, named in the skill's `metadata.tool` as `name@version`, built without `HF_HUB_OFFLINE`, holding `huggingface_hub` and python3. A recipe never pip-installs.
-- **The identity is the recipe's inputs.** The skill states the source, its pull date, every parameter, and the tool version in prose; the record carries them. A change to any of them is a new version; a change that makes the result incomparable (a threshold, a species) is a new dataset.
+- **A recipe is instructions; the cook runs it.** `recipe/build` reads `recipe/params.toml` and writes a version's files into one directory. One job is the default; a split recipe is several programs in `recipe/` and prose stating their order, each one's tool, and each one's compute. It names no runtime: it runs inside its tools' images, under `srun` on a cluster or `podman run` on a laptop. Nothing here runs, schedules, or orders a recipe.
+- **The recipe's tools are toolshed tools**, named in the skill's `metadata.tools` as one or more `name@version` separated by single spaces; the one that pushes is built without `HF_HUB_OFFLINE` and holds `huggingface_hub` and python3 (the shed's `datascience`). A recipe never pip-installs.
+- **The identity is the recipe's inputs.** The skill states the source, its pull date, every parameter, and the tools' versions in prose; the record carries them. A change to any of them is a new version; a change that makes the result incomparable (a threshold, a species) is a new dataset.
 - **Variants are datasets, versions are time.** Copy the sibling's directory, change what differs, give it its own name.
 - **Any change under `datasets/<name>/` bumps `metadata.version`**, prose included. A published tag is never moved; readers always name a version.
-- **The skill's frontmatter is `name`, `description`, `metadata.version`, `metadata.tool`, `metadata.license`.** Everything else is prose. No declared schemas.
+- **The skill's frontmatter is `name`, `description`, `metadata.version`, `metadata.tools`, `metadata.license`.** Everything else is prose. No declared schemas.
 - **The test judges the real output**, in seconds, from footers and samples: the files, the schema, row counts above the recipe's floor, the recipe's own checks. It is not the recipe on a slice.
-- **Never a credential in the repository**: `scripts/push` reads `HF_TOKEN` and never prints it; `scripts/build`, `scripts/record`, and `check` refuse what looks like one.
+- **Never a credential in the repository**: `scripts/push` reads `HF_TOKEN` and never prints it; `scripts/push`, `scripts/record`, and `check` refuse what looks like one.
 
 ## Rules the repository keeps
 
-- `scripts/check.py` and `scripts/record` run with the Python standard library alone (`python3 -I`): flyloft's host runs them, and so do login nodes. `scripts/push` and `scripts/promote` need `huggingface_hub`, which the recipe's tool image and CI have.
+- `scripts/check.py` and `scripts/record` run with the Python standard library alone (`python3 -I`): flyloft's host runs them, and so do login nodes. `scripts/push` and `scripts/promote` need `huggingface_hub`, which `datascience` and CI have.
 - Nothing in `scripts/` or `.github/` names the lab: the org comes from `hub.toml`, so a fork with its own org is its own catalogue and store.
-- CI runs on hosted runners and never builds, tests, or pulls a dataset. Whoever builds a dataset tests its output where it was built and commits the record; nobody can claim a version exists without one.
+- CI runs on hosted runners and never runs a recipe or pulls a dataset. Whoever cooks a dataset tests its output where it was built, files it with `scripts/push`, and commits the record; nobody can claim a version exists without one.
 - Every dataset is reviewed by someone other than its builder before it merges.
 
 ## What not to build

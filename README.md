@@ -36,6 +36,6 @@ For Codex and OpenCode, link into `~/.agents/skills/` instead. `git pull` update
 
 ## Versions
 
-A dataset's version is a tag, `v<version>`, on its Hub repository, and a published tag is never moved. A version changes when the source is re-pulled, a parameter moves, or the tool moves; a variant (another species, another threshold) is another dataset.
+A dataset's version is a tag, `v<version>`, on its Hub repository, and a published tag is never moved. A version changes when the source is re-pulled, a parameter moves, or a tool moves; a variant (another species, another threshold) is another dataset.
 
-CI checks every pull request: the dataset's rules, an unpublished version, the recipe's tool in the toolshed, and a record of the candidate's passing test whose files are exactly the Hub's. On merge it tags the record's commit. CI never builds, tests, or pulls a dataset.
+CI checks every pull request: the dataset's rules, an unpublished version, the recipe's tools in the toolshed, and a record of the candidate's passing test whose files are exactly the Hub's. On merge it tags the record's commit. CI checks records and never pulls a dataset; whoever builds a dataset tests it and files it.
