@@ -63,7 +63,7 @@ Commit the dataset directory first: `scripts/push` names the candidate by the co
 
 ```bash
 img=ghcr.io/brineylab/toolshed/datascience:1.0.0; out=$(mktemp -d); started=$(date -u +%FT%TZ)
-run() { podman run --rm -e HF_TOKEN -v "$PWD":/work -v "$out":/out -w /work "$img" "$@"; }
+run() { podman run --rm --pids-limit=-1 -e HF_TOKEN -v "$PWD":/work -v "$out":/out -w /work "$img" "$@"; }
 run datasets/<name>/recipe/build /out
 run datasets/<name>/recipe/test /out > "$out.test"; code=$?
 if [ "$code" = 0 ]; then
@@ -84,7 +84,7 @@ code=$?
 [ "$code" = 0 ] && scripts/record <name> "$(sed -n 's/^commit: //p' "$out.run")" "$code" "srun --partition=<p> --cpus-per-task=<n> --mem=<m>" "$(sed -n 's/^host: //p' "$out.run")" "$started" < "$out.run"
 ```
 
-Mount `$out` and anything else the recipe reads (a shared data directory), or the job writes into the container's own filesystem, which goes with the job. The `host:` line is the compute node's, where the build and test ran. On coreweave-rtx6000, a CPU-only recipe takes `--partition=hpc-low`: a GPU node's spare CPUs, at most 32 CPUs and 240G. A failed build or test is fixed, never filed: when `code` is not 0, read `$out.err`, fix the recipe, commit, and cook again.
+On a laptop, `--pids-limit=-1` lifts podman's default of 2048 processes and threads per container, which abstar passes with a dozen worker processes: each starts polars' thread pools, sized to the machine. Mount `$out` and anything else the recipe reads (a shared data directory), or the job writes into the container's own filesystem, which goes with the job. The `host:` line is the compute node's, where the build and test ran. On coreweave-rtx6000, a CPU-only recipe takes `--partition=hpc-low`: a GPU node's spare CPUs, at most 32 CPUs and 240G. A failed build or test is fixed, never filed: when `code` is not 0, read `$out.err`, fix the recipe, commit, and cook again.
 
 `scripts/push` uploads the output to the Hub's candidate branch, `candidate-<tree>` on `<org>/<name>`, replacing an earlier candidate of the same tree, writes the card from the skill, and prints one `file <path> <size> <sha256>` line per file and `commit: <sha>` last. `scripts/record` writes `results/<name>/<version>.txt` from that output. Commit it: `git add results/<name>/<version>.txt`.
 
