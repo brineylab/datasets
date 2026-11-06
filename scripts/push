@@ -46,16 +46,19 @@ def main() -> int:
     if reasons:
         print("\n".join(reasons), file=sys.stderr)
         return 1
-    try:  # the candidate names the committed recipe, so what is pushed must be what is committed
-        git = subprocess.run(["git", "status", "--porcelain", "--ignored", "--", f"datasets/{name}"],
-                             cwd=check.ROOT, capture_output=True, text=True)
-        why = git.stderr.strip() if git.returncode else None
+    # The candidate names the committed recipe, so what is pushed must be what is committed: git status, and
+    # the files' tree against HEAD's, which no config (showUntrackedFiles, skip-worktree) can hide.
+    try:
+        status, head = (subprocess.run(["git", *args], cwd=check.ROOT, capture_output=True, text=True) for args in (
+            ["status", "--porcelain", "--ignored", "--untracked-files=all", "--", f"datasets/{name}"],
+            ["rev-parse", f"HEAD:datasets/{name}/recipe"]))
+        why = next((g.stderr.strip() for g in (status, head) if g.returncode), None)
     except OSError as e:
         why = str(e)
     if why is not None:
         print(f"cannot tell whether datasets/{name} is committed: {why}", file=sys.stderr)
         return 1
-    if git.stdout.strip():
+    if status.stdout.strip() or head.stdout.strip() != check.tree_hash(dataset / "recipe"):
         print(f"datasets/{name} has uncommitted changes; commit them first", file=sys.stderr)
         return 1
     files = sorted(p for p in out.rglob("*") if p.is_file() and not any(part.startswith(".") for part in p.relative_to(out).parts)) if out.is_dir() else []

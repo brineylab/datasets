@@ -1,8 +1,8 @@
 name: datasets
 
-# On GitHub's hosted runners only. This never builds, tests, or pulls a dataset. check: every pull
+# On GitHub's hosted runners only. This never runs a recipe or pulls a dataset. check: every pull
 # request, the scripts' unit tests and, for each changed dataset, its rules, a version not yet on
-# the Hub, its tool in the toolshed, and a passing record whose files the Hub holds exactly.
+# the Hub, its tools in the toolshed, and a passing record whose files the Hub holds exactly.
 # promote: a push to main that changes a dataset, tagging its record's commit as the version on the
 # Hub and deleting the candidate branch; it needs the repository secret HF_TOKEN, with write on the
 # org's datasets.

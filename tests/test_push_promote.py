@@ -68,6 +68,11 @@ class PushPromoteTests(unittest.TestCase):
         (self.repo / "datasets/tiny/recipe/x.tmp").write_text("x\n")
         self.assertIn("datasets/tiny has uncommitted changes; commit them first", self.refused(self.out))
 
+    def test_push_refuses_an_untracked_file_a_users_git_config_hides(self):
+        git(self.repo, "config", "status.showUntrackedFiles", "no")
+        (self.repo / "datasets/tiny/recipe/extra").write_text("x\n")
+        self.assertIn("datasets/tiny has uncommitted changes; commit them first", self.refused(self.out))
+
     def test_push_refuses_when_git_cannot_say_the_inputs_are_committed(self):
         shutil.rmtree(self.repo / ".git")
         r = self.run_script("scripts/push", "tiny", self.out)
