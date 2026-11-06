@@ -97,10 +97,35 @@ class PushPromoteTests(unittest.TestCase):
         self.assertTrue(card.startswith("---\nlicense: mit\npretty_name: tiny\n---\n")); self.assertIn("## Files", card)
         self.assertNotIn("hello@1.0.1", card)  # the skill's frontmatter stays in the skill
 
-    def record(self, commit):
+    def record(self, commit, merged=True):
+        """The record, committed; merged, origin/main holds that commit, as after the pull request's merge."""
         (self.repo / "results/tiny").mkdir(parents=True)
         (self.repo / "results/tiny/1.0.0.txt").write_text(f"---\ndataset: tiny\nversion: 1.0.0\nhub: brineylab/tiny\nbranch: {self.branch}\n"
                                                          f"commit: {commit}\ntree: {self.tree}\nexit: 0\n---\ncommit: {commit}\n")
+        git(self.repo, "add", "results"); git(self.repo, "commit", "-qm", "record")
+        if merged:
+            git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    def test_promote_refuses_a_record_that_is_not_on_main(self):
+        self.hub.write_text(json.dumps({"branches": {self.branch: "c" * 40}}))
+        git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.record("c" * 40, merged=False)
+        r = self.run_script("scripts/promote", "tiny", "1.0.0")
+        self.assertEqual(r.returncode, 1); self.assertIn("results/tiny/1.0.0.txt is not on origin/main (", r.stderr); self.assertIn("merge its pull request and pull first", r.stderr)
+        self.assertEqual(self.state().get("calls", []), [])  # nothing reached the Hub
+
+    def test_promote_says_why_git_cannot_find_the_record_on_main(self):
+        self.record("c" * 40)
+        shutil.rmtree(self.repo / ".git")  # as in a worktree whose main clone is not mounted
+        r = self.run_script("scripts/promote", "tiny", "1.0.0")
+        self.assertEqual(r.returncode, 1); self.assertIn("results/tiny/1.0.0.txt is not on origin/main (", r.stderr)
+        self.assertIn("not a git repository", r.stderr); self.assertNotIn("Traceback", r.stderr)
+
+    def test_promote_refuses_a_merged_record_missing_here(self):
+        self.record("c" * 40)
+        (self.repo / "results/tiny/1.0.0.txt").unlink()
+        r = self.run_script("scripts/promote", "tiny", "1.0.0")
+        self.assertEqual(r.returncode, 1); self.assertIn("is not on origin/main", r.stderr); self.assertNotIn("Traceback", r.stderr)
 
     def test_promote_tags_the_records_commit_and_deletes_the_branch(self):
         self.hub.write_text(json.dumps({"branches": {"main": "m" * 40, self.branch: "c" * 40}}))
