@@ -39,9 +39,9 @@ Name the columns you need: each file holds some 340.
 
 1. Annotate every contig with abstar 0.9.0 (`germline_database = "human"`). 0.9.0 matters: it writes `sequence_vdj_aa`, the variable domain, which the clustering uses; in 0.9.0 `sequence_aa` is the translated input, as AIRR 2.0 defines it.
 2. Pair within each sample: a droplet's barcode is the contig id up to its first underscore. Keep a droplet only with exactly one heavy chain (`IGH`) and one light (`IGK` or `IGL`), both productive by abstar. The build prints what it dropped, by shape (`dropped 1H2L: <n>`) and for productivity (`dropped unproductive: <n>`); the record carries those lines.
-3. Cluster every pair with `mmseqs easy-cluster --min-seq-id 0.85 -c 0.8 --cov-mode 0` (`identity`, `coverage`; 80% of both sequences) on the heavy chain's `sequence_vdj_aa` joined to the light chain's.
+3. Cluster every pair with `mmseqs easy-cluster --min-seq-id 0.85 -c 0.8 --cov-mode 0` (`identity`, `coverage`; 80% of both sequences) on the heavy chain's `sequence_vdj_aa` joined to the light chain's. The mmseqs `datascience` carries (abutils' build, commit 7e28409) dies in `easy-cluster`'s prefilter on about 1.1M sequences, so a set over 500k is clustered as a cascade: its pairs, in sample order, in parts of at most 500k, each part clustered, then the parts' representatives clustered the same way, and each pair takes its representative's representative.
 4. Split by cluster `[0.96, 0.02, 0.02]`: the representatives, sorted, are shuffled with `random.Random(seed = 1)`, and whole clusters go to train until it holds 96% of the pairs, then to eval until 2%, then to test. No 85% cluster spans two splits. Eval and test keep the 85% representatives.
-5. Re-cluster every train pair at 95% (`train_identity`), same command and coverage; train keeps the 95% representatives.
+5. Re-cluster every train pair at 95% (`train_identity`), the same way; train keeps the 95% representatives.
 
 `params.toml` also holds `limit = 0`, the number of samples for a developer's dry run; 0 is all.
 
@@ -53,6 +53,7 @@ Measured by the first full build.
 
 ## Gotchas
 
+- The cascade is not one clustering. Measured on 500k of these pairs, cascaded in parts of 250k against one `easy-cluster` run: it gave 93,152 clusters to the single run's 296,594, mostly by finding real matches the single run's prefilter (`--max-seqs 20`) missed, but by chaining, 13% of non-representative pairs sit under 85% identity to their representative (down to 75%; 1% in the single run), and it split 4,109 of the single run's clusters. So `cluster_85` errs toward merging, which guards the splits against leakage, and is not a strict 85% bound.
 - Barcodes are unique only within a sample; `pair_id` carries the sample for that reason.
 - The droplet rule drops about 9% of droplets (sample 1279049: 389 with two lights, 299 with two of each, 49 with two heavies, 118 with one chain, of 9,808).
 - Eval and test hold one pair per 85% cluster, so they are far fewer rows than 2% of the pairs: they are cluster-level held-out sets.
