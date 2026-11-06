@@ -25,9 +25,9 @@ hub.toml                          the Hub org this repository publishes to
 scripts/check.py                  a dataset directory's rules, its record, and whether its version is published
 scripts/push <name> <output dir>          upload the cook's output and the card to the Hub's candidate branch; prints the manifest and `commit:`
 scripts/record <name> <commit> <exit> <runner> <host> <started> < output   write a record from the test's and push's output
-scripts/promote <name> <version>          tag the record's commit on the Hub, never moving a tag; delete the candidate branch
+scripts/promote <name> <version>          after the merge, by whoever merged: tag the record's commit on the Hub, never moving a tag; delete the candidate branch
 tests/                            unit tests of the scripts, with the Hub stubbed
-.github/workflows/datasets.yml    check and promote, on hosted runners
+.github/workflows/datasets.yml    check, on hosted runners
 ```
 
 ## Commands
@@ -52,7 +52,7 @@ datasets/<name>/recipe/build <out> && datasets/<name>/recipe/test <out> && pytho
 
 ## Rules the repository keeps
 
-- `scripts/check.py` and `scripts/record` run with the Python standard library alone (`python3 -I`): flyloft's host runs them, and so do login nodes. `scripts/push` and `scripts/promote` need `huggingface_hub`, which `datascience` and CI have.
+- `scripts/check.py` and `scripts/record` run with the Python standard library alone (`python3 -I`): flyloft's host runs them, and so do login nodes. `scripts/push` and `scripts/promote` need `huggingface_hub`, which `datascience` has.
 - Nothing in `scripts/` or `.github/` names the lab: the org comes from `hub.toml`, so a fork with its own org is its own catalogue and store.
 - CI runs on hosted runners and never runs a recipe or pulls a dataset. Whoever cooks a dataset tests its output where it was built, files it with `scripts/push`, and commits the record; nobody can claim a version exists without one.
 - Every dataset is reviewed by someone other than its builder before it merges.
@@ -63,4 +63,4 @@ A dataset exists because a question needed it. Do not add datasets, parameters, 
 
 ## Commits and pull requests
 
-A commit message is one sentence stating the behavior. A dataset arrives as a pull request whose record is committed with it. Merge with a merge commit (`gh pr merge --merge`): `promote` runs on the merge commit, and flyloft watches that check.
+A commit message is one sentence stating the behavior. A dataset arrives as a pull request whose record is committed with it. Merge with a merge commit (`gh pr merge --merge`), then pull `main` and run `scripts/promote <name> <version>` with your own `HF_TOKEN`, in `datascience`: CI holds no Hub token.
