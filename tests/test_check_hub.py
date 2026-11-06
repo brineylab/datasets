@@ -65,8 +65,8 @@ class HubTests(unittest.TestCase):
                           check.hub_problems(d, RESULTS))
 
     def test_a_record_of_another_tool_is_refused(self):
-        text = (RESULTS / "tiny" / "1.0.0.txt").read_text().replace("tool: hello@1.0.1", "tool: hello@1.0.0")
-        self.assertIn("the record's tool hello@1.0.0 is not the skill's hello@1.0.1", check.hub_problems(TINY, self.results_with(text)))
+        text = (RESULTS / "tiny" / "1.0.0.txt").read_text().replace("tools: hello@1.0.1", "tools: hello@1.0.0")
+        self.assertIn("the record's tools hello@1.0.0 is not the skill's hello@1.0.1", check.hub_problems(TINY, self.results_with(text)))
 
     def test_a_record_holding_a_credential_is_refused(self):
         text = (RESULTS / "tiny" / "1.0.0.txt").read_text() + "HF_TOKEN=hf_" + "a" * 34 + "\n"
@@ -76,6 +76,13 @@ class HubTests(unittest.TestCase):
         with copy_of(TINY) as d:
             skill = d / "SKILL.md"; skill.write_text(skill.read_text().replace("hello@1.0.1", "nothere@1.0.0"))
             self.assertIn("nothere@1.0.0 is not in the toolshed", check.hub_problems(d, RESULTS))
+
+    def test_a_second_tool_the_shed_lacks_is_refused(self):
+        with copy_of(TINY) as d:
+            skill = d / "SKILL.md"; skill.write_text(skill.read_text().replace("hello@1.0.1", "hello@1.0.1 nothere@1.0.0"))
+            problems = check.hub_problems(d, RESULTS)
+            self.assertIn("nothere@1.0.0 is not in the toolshed", problems)
+            self.assertNotIn("hello@1.0.1 is not in the toolshed", problems)
 
     def test_a_tool_at_a_version_the_shed_lacks_is_refused(self):
         with copy_of(TINY) as d:

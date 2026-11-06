@@ -1,13 +1,16 @@
 #!/usr/bin/env -S python3 -I
-"""scripts/push <name> <outroot>: upload what scripts/build wrote, <outroot>/<name>/<tree>/, to the Hub as the
-candidate, the branch candidate-<tree> on <org>/<name>, replacing any earlier one; then the card, README.md,
-from the skill. Prints one `file <path> <size> <sha256>` line per data file and last `commit: <sha>`, the
-branch's head, which scripts/record reads. Paths under a name starting with `.` (.built, a recipe's .work/)
-are neither uploaded nor listed. The token is HF_TOKEN's and is never printed. Runs inside the recipe's tool
-image, which holds huggingface_hub.
+"""scripts/push <name> <output dir>: upload the directory the cook ran the recipe into to the Hub as the
+candidate, the branch candidate-<tree> on <org>/<name>, <tree> the committed recipe's, replacing any earlier
+one; then the card, README.md, from the skill. Refuses, before anything reaches the Hub, a dataset directory
+that breaks check.py's rules (a credential among them: the card goes public here), one with uncommitted or
+ignored changes, or one git cannot speak for, and an output holding no data files. Prints one
+`file <path> <size> <sha256>` line per data file and last `commit: <sha>`, the branch's head, which
+scripts/record reads. Paths under a name starting with `.` (a recipe's .work/) are neither uploaded nor
+listed. The token is HF_TOKEN's and is never printed. Runs inside an image holding huggingface_hub and git.
 """
 import hashlib
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,20 +38,32 @@ def card(skill: Path) -> str:
 
 def main() -> int:
     if len(sys.argv) != 3:
-        print("usage: scripts/push <name> <outroot>", file=sys.stderr)
+        print("usage: scripts/push <name> <output dir>", file=sys.stderr)
         return 2
-    name, outroot = sys.argv[1], Path(sys.argv[2]).resolve()
+    name, out = sys.argv[1], Path(sys.argv[2]).resolve()
     dataset = check.ROOT / "datasets" / name
+    reasons = check.rules(dataset)
+    if reasons:
+        print("\n".join(reasons), file=sys.stderr)
+        return 1
+    try:  # the candidate names the committed recipe, so what is pushed must be what is committed
+        git = subprocess.run(["git", "status", "--porcelain", "--ignored", "--", f"datasets/{name}"],
+                             cwd=check.ROOT, capture_output=True, text=True)
+        why = git.stderr.strip() if git.returncode else None
+    except OSError as e:
+        why = str(e)
+    if why is not None:
+        print(f"cannot tell whether datasets/{name} is committed: {why}", file=sys.stderr)
+        return 1
+    if git.stdout.strip():
+        print(f"datasets/{name} has uncommitted changes; commit them first", file=sys.stderr)
+        return 1
+    files = sorted(p for p in out.rglob("*") if p.is_file() and not any(part.startswith(".") for part in p.relative_to(out).parts)) if out.is_dir() else []
+    if not files:
+        print(f"{sys.argv[2]} holds no files to push", file=sys.stderr)
+        return 1
     tree = check.tree_hash(dataset / "recipe")
-    out = outroot / name / tree
-    if not (out / ".built").exists():
-        print(f"{out} is not built; run scripts/build {name} {outroot} first", file=sys.stderr)
-        return 1
     meta = check.frontmatter(dataset / "SKILL.md")["metadata"]
-    built = (out / ".built").read_text().strip()
-    if built != meta["tool"]:  # the tool is part of a version's identity, and not of <tree>
-        print(f"{out} was built with {built}, not the skill's {meta['tool']}; remove it and build again", file=sys.stderr)
-        return 1
     if not os.environ.get("HF_TOKEN"):
         print("HF_TOKEN is not set: a Hub token with write access to the org's datasets", file=sys.stderr)
         return 1
@@ -63,7 +78,6 @@ def main() -> int:
                       commit_message=f"{name} {meta['version']}: the output of recipe tree {tree}")
     head = api.upload_file(path_or_fileobj=card(dataset / "SKILL.md").encode(), path_in_repo="README.md", repo_id=repo,
                            repo_type="dataset", revision=branch, commit_message=f"{name} {meta['version']}: the card")
-    files = sorted(p for p in out.rglob("*") if p.is_file() and not any(part.startswith(".") for part in p.relative_to(out).parts))
     for p in files:
         print(f"file {p.relative_to(out).as_posix()} {p.stat().st_size} {sha256(p)}")
     print(f"commit: {head.oid}")
