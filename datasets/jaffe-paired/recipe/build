@@ -42,7 +42,7 @@ def download(dest: Path) -> None:
         if path.exists():
             continue
         part, h = path.with_suffix(".part"), hashlib.md5()
-        req = urllib.request.Request(f"https://figshare.com/ndownloader/files/{fid}", headers={"User-Agent": "brineylab-datasets"})
+        req = urllib.request.Request(f"https://ndownloader.figshare.com/files/{fid}", headers={"User-Agent": "brineylab-datasets"})
         with urllib.request.urlopen(req) as r, open(part, "wb") as f:
             for block in iter(lambda: r.read(1 << 22), b""):
                 h.update(block)
