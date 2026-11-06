@@ -1,0 +1,64 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/test <out>: exit 0 iff <out> holds a version of jaffe-paired. Reads the parquet footers and only the
+columns each check needs; one line per failure, naming the check and the first offending pair_id."""
+import sys
+from pathlib import Path
+
+import polars as pl
+
+FLOORS = {"train": 1, "eval": 1, "test": 1}  # rows; set to 90% of the first full build's
+FRONT = ["pair_id", "sample", "donor", "flow_class", "cluster_85"]
+FIELDS = ["sequence_id", "locus", "productive", "v_call", "j_call", "sequence_vdj", "sequence_vdj_aa", "cdr3_aa", "fwr4_aa"]
+
+out, problems = Path(sys.argv[1]), []
+frames, chain_columns = {}, None
+for split, floor in FLOORS.items():
+    path = out / f"{split}.parquet"
+    if not path.is_file():
+        problems.append(f"files: {split}.parquet is missing")
+        continue
+    lf = pl.scan_parquet(path)
+    columns = lf.collect_schema().names()
+    want = FRONT + (["cluster_95"] if split == "train" else []) + [f"{f}:{i}" for f in FIELDS for i in (0, 1)]
+    missing = [c for c in want if c not in columns]
+    if missing:
+        problems.append(f"columns: {split}.parquet lacks {missing}")
+        continue
+    chains = sorted(c for c in columns if c.endswith((":0", ":1")))
+    if {c[:-2] for c in chains if c.endswith(":0")} != {c[:-2] for c in chains if c.endswith(":1")}:
+        problems.append(f"columns: {split}.parquet's heavy and light fields differ")
+    if chain_columns is not None and chains != chain_columns:
+        problems.append(f"columns: {split}.parquet's chain fields are not train's")
+    chain_columns = chain_columns or chains
+    rows = lf.select(pl.len()).collect().item()
+    if rows < floor:
+        problems.append(f"rows: {split}.parquet has {rows}, under its floor {floor}")
+    df = lf.select("pair_id", "cluster_85", *[f"{f}:{i}" for f in ("locus", "productive", "sequence_vdj_aa", "fwr4_aa") for i in (0, 1)]).collect()
+    frames[split] = df.select("pair_id", "cluster_85")
+    bad = {
+        "productive": ~(pl.col("productive:0") & pl.col("productive:1")),
+        "locus": (pl.col("locus:0") != "IGH") | ~pl.col("locus:1").is_in(["IGK", "IGL"]),
+    }
+    for i in (0, 1):
+        seq = pl.col(f"sequence_vdj_aa:{i}")
+        bad[f"sequence_vdj_aa:{i} gap or stop"] = seq.str.contains(r"[-.*]")
+        bad[f"sequence_vdj_aa:{i} ends with fwr4_aa:{i}"] = ~seq.str.ends_with(pl.col(f"fwr4_aa:{i}"))
+    for check, expr in bad.items():
+        hit = df.filter(expr.fill_null(True))
+        if hit.height:
+            problems.append(f"{check}: {hit.height} rows in {split}.parquet, first {hit['pair_id'][0]}")
+    print(f"{split}.parquet {rows} rows")
+
+for key in ("pair_id", "cluster_85"):
+    seen = {}
+    for split, df in frames.items():
+        for value in df[key].unique():
+            if value in seen:
+                problems.append(f"{key}: {value} is in {seen[value]} and {split}")
+                break
+            seen[value] = split
+for split, df in frames.items():
+    if df["pair_id"].n_unique() != df.height:
+        problems.append(f"pair_id: {split}.parquet repeats one")
+print("\n".join(problems) or "ok")
+sys.exit(1 if problems else 0)
