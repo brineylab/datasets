@@ -66,23 +66,25 @@ img=ghcr.io/brineylab/toolshed/datascience:1.0.0; out=$(mktemp -d); started=$(da
 run() { podman run --rm -e HF_TOKEN -v "$PWD":/work -v "$out":/out -w /work "$img" "$@"; }
 run datasets/<name>/recipe/build /out
 run datasets/<name>/recipe/test /out > "$out.test"; code=$?
-HF_TOKEN=$(< ~/.cache/huggingface/token) run python3 -I scripts/push <name> /out > "$out.push"
-cat "$out.test" "$out.push" | scripts/record <name> "$(sed -n 's/^commit: //p' "$out.push")" "$code" podman "$(hostname)" "$started"
+if [ "$code" = 0 ]; then
+  HF_TOKEN=$(< ~/.cache/huggingface/token) run python3 -I scripts/push <name> /out > "$out.push"
+  cat "$out.test" "$out.push" | scripts/record <name> "$(sed -n 's/^commit: //p' "$out.push")" "$code" podman "$(hostname)" "$started"
+fi
 ```
 
-**On a Slurm cluster with pyxis**, from a clone on the login node, `out` a directory with room for the output and its staging, and `HF_TOKEN` exported from your token file (pyxis passes your environment into the container; never export `HF_HUB_OFFLINE`, which stops the recipe's downloads and the push):
+**On a Slurm cluster with pyxis**, from a clone on the login node, with `out` a directory on shared storage with room for the output and its staging. Pyxis passes your environment into the container, so export the token there, and never `HF_HUB_OFFLINE`, which stops the recipe's downloads and the push:
 
 ```bash
-started=$(date -u +%FT%TZ)
+export HF_TOKEN=$(< ~/.cache/huggingface/token); out=<a directory on shared storage>; mkdir -p "$out"; started=$(date -u +%FT%TZ)
 srun --partition=<p> --cpus-per-task=<n> --mem=<m> --time=<t> \
   --container-image=ghcr.io#brineylab/toolshed/datascience:1.0.0 \
-  --container-mounts="$PWD":"$PWD",/mnt/data:/mnt/data --container-workdir="$PWD" \
-  bash -c "datasets/<name>/recipe/build $out && datasets/<name>/recipe/test $out && python3 -I scripts/push <name> $out" > run.out 2>&1
+  --container-mounts="$PWD":"$PWD","$out":"$out" --container-workdir="$PWD" \
+  bash -c "echo host: \$(hostname -f) && datasets/<name>/recipe/build $out && datasets/<name>/recipe/test $out && python3 -I scripts/push <name> $out" > "$out.run" 2> "$out.err"
 code=$?
-scripts/record <name> "$(sed -n 's/^commit: //p' run.out)" "$code" "srun --partition=<p> --cpus-per-task=<n> --mem=<m>" "$(hostname -f)" "$started" < run.out
+[ "$code" = 0 ] && scripts/record <name> "$(sed -n 's/^commit: //p' "$out.run")" "$code" "srun --partition=<p> --cpus-per-task=<n> --mem=<m>" "$(sed -n 's/^host: //p' "$out.run")" "$started" < "$out.run"
 ```
 
-On coreweave-rtx6000, a CPU-only recipe takes `--partition=hpc-low`: a GPU node's spare CPUs, at most 32 CPUs and 240G. A failed build or test is fixed, never filed: when `code` is not 0, read `run.out`, fix the recipe, commit, and cook again.
+Mount `$out` and anything else the recipe reads (a shared data directory), or the job writes into the container's own filesystem, which goes with the job. The `host:` line is the compute node's, where the build and test ran. On coreweave-rtx6000, a CPU-only recipe takes `--partition=hpc-low`: a GPU node's spare CPUs, at most 32 CPUs and 240G. A failed build or test is fixed, never filed: when `code` is not 0, read `$out.err`, fix the recipe, commit, and cook again.
 
 `scripts/push` uploads the output to the Hub's candidate branch, `candidate-<tree>` on `<org>/<name>`, replacing an earlier candidate of the same tree, writes the card from the skill, and prints one `file <path> <size> <sha256>` line per file and `commit: <sha>` last. `scripts/record` writes `results/<name>/<version>.txt` from that output. Commit it: `git add results/<name>/<version>.txt`.
 
@@ -90,7 +92,7 @@ On coreweave-rtx6000, a CPU-only recipe takes `--partition=hpc-low`: a GPU node'
 
 The record's header names the Hub repository, the candidate branch and its head commit, the recipe's tree, the tools, the runner, the host, the start time, and the exit code; its body is the recipe's test output and push's manifest. `check` proves it on every pull request: the exit code is 0, the tree is the committed recipe's, the tools are the skill's, and the Hub's commit holds exactly the record's files with the record's sha256. Nobody can claim a version exists without one.
 
-A change after cooking changes the tree, so cook, push, and record again. A prose-only change to the skill leaves the tree alone: push again (the Hub skips the files it holds, so only the card moves) and record again.
+A change after cooking changes the tree, so cook, push, and record again. A prose-only change to the skill leaves the tree alone, but it still bumps the version: push the same output again (the Hub skips the files it holds, so only the card moves) and record the new version.
 
 ## Versions
 
