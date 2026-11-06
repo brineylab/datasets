@@ -1,10 +1,13 @@
 #!/usr/bin/env -S python3 -I
 """scripts/promote <name> <version>: tag the commit results/<name>/<version>.txt names as v<version> on
-<org>/<name>, then delete the candidate branch. A tag is never moved: one already naming another commit
-exits 1; one already naming the record's commit passes, so a promote run again after it succeeded passes.
-The last line of stdout says what happened. The token is HF_TOKEN's. CI runs it on a push to main.
+<org>/<name>, then delete the candidate branch. Whoever merges the dataset's pull request runs it after
+pulling main, with their own HF_TOKEN; a record that is not on origin/main as it is here is refused, so only
+a reviewed, merged record is published. A tag is never moved: one already naming another commit exits 1;
+one already naming the record's commit passes, so a promote run again after it succeeded passes. The last
+line of stdout says what happened.
 """
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,7 +22,12 @@ def main() -> int:
         print("usage: scripts/promote <name> <version>", file=sys.stderr)
         return 2
     name, version = sys.argv[1:]
-    rec = check.parse_record(check.ROOT / "results" / name / f"{version}.txt")
+    rel = f"results/{name}/{version}.txt"
+    merged = subprocess.run(["git", "show", f"origin/main:{rel}"], cwd=check.ROOT, capture_output=True)
+    if merged.returncode or merged.stdout != (check.ROOT / rel).read_bytes():
+        print(f"{rel} is not on origin/main; merge its pull request and pull first", file=sys.stderr)
+        return 1
+    rec = check.parse_record(check.ROOT / rel)
     repo, tag, commit = f"{check.hub_org()}/{name}", f"v{version}", rec["commit"]
     api = HfApi(token=os.environ["HF_TOKEN"])
     have = {t.name: t.target_commit for t in api.list_repo_refs(repo, repo_type="dataset").tags}

@@ -103,4 +103,11 @@ Any change under `datasets/<name>/` bumps `metadata.version`, prose included. A 
 1. Push your branch and open the pull request, the record committed in it.
 2. `check` runs: the dataset's rules, an unpublished version, each tool in the toolshed at its version, and a record of a passing test whose files the Hub holds exactly.
 3. Someone other than you reviews it, a critic agent included: does the skill describe the files the record lists and state the recipe's inputs; does the record show the test passed where the build ran; is the version new; are the tools the ones the record shows. They merge with a merge commit (`gh pr merge --merge`).
-4. `promote` tags the record's commit `v<version>` on the Hub and deletes the candidate branch.
+4. Whoever merged promotes it: pull `main`, then, from the clone's root,
+
+   ```bash
+   HF_TOKEN=$(< ~/.cache/huggingface/token) podman run --rm -e HF_TOKEN -v "$PWD":/work -w /work \
+     ghcr.io/brineylab/toolshed/datascience:1.0.0 python3 -I scripts/promote <name> <version>
+   ```
+
+   It tags the record's commit `v<version>` on the Hub and deletes the candidate branch; its last line says what it did. It refuses a record that is not on `origin/main`. CI holds no Hub token, so nothing is published until someone runs it.

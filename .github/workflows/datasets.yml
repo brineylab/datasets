@@ -2,16 +2,11 @@ name: datasets
 
 # On GitHub's hosted runners only. This never runs a recipe or pulls a dataset. check: every pull
 # request, the scripts' unit tests and, for each changed dataset, its rules, a version not yet on
-# the Hub, its tools in the toolshed, and a passing record whose files the Hub holds exactly.
-# promote: a push to main that changes a dataset, tagging its record's commit as the version on the
-# Hub and deleting the candidate branch; it needs the repository secret HF_TOKEN, with write on the
-# org's datasets.
+# the Hub, its tools in the toolshed, and a passing record whose files the Hub holds exactly. CI holds
+# no Hub token: whoever merges runs scripts/promote with their own.
 
 on:
   pull_request:
-  push:
-    branches: [main]
-    paths: ["datasets/**"]
 
 permissions:
   contents: read
@@ -22,7 +17,6 @@ defaults:
 
 jobs:
   check:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -38,25 +32,3 @@ jobs:
           failed=0
           for d in $datasets; do python3 -I scripts/check.py --hub "datasets/$d" || failed=1; done
           exit "$failed"
-
-  promote:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - run: python3 -m pip install -q huggingface_hub
-      - env:
-          BEFORE: ${{ github.event.before }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          datasets=$(scripts/changed-datasets "$BEFORE" "$GITHUB_SHA")
-          [[ -n "$datasets" ]] || { echo "no dataset to promote"; exit 0; }
-          for d in $datasets; do
-            VERSION=$(python3 -I -c "import sys; sys.path.insert(0, 'scripts'); import check, pathlib; print(check.frontmatter(pathlib.Path('datasets/$d/SKILL.md'))['metadata']['version'])")
-            python3 -I scripts/promote "$d" "$VERSION" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
-          done
