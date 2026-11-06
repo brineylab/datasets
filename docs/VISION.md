@@ -14,6 +14,7 @@ Status: approved by the lab on 2026-11-04 (flyloft issue [#174](https://github.c
 - Not a store of bytes: the Hub holds every file; git holds recipes, skills, and records.
 - Not a loader or a feature store: a dataset is files, and what reads them is project code.
 - Not a place for one campaign's own split or subset: that stays in the campaign's directory. A dataset is for what the lab will use again.
+- Not a runner: a recipe is instructions, and whoever cooks it runs it anywhere, as one job or several; this repository holds recipes and records and files results.
 - Not built by CI: whoever asks for a dataset builds it where it will be built, tests the output, and commits the record. CI checks records and never pulls a dataset.
 
 **Measures of success.** A researcher names a dataset and a version and reads its files from anywhere in one line. A dataset the lab lacks is built from a recipe, reviewed, and published for everyone. Two people who trained on the same name and version trained on the same bytes, and the record says what made them.
