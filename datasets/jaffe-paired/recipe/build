@@ -24,9 +24,6 @@ SOURCE = {34846953: ("test_data.tar.gz", 11941014666, "4d87c4da2d407ba95180be2cb
           34846938: ("test_data.csv", 1981, "3ccae335a8a03b5a771dc0eae97f7af6")}
 FASTA = "test_data/*/outs/per_sample_outs/*/vdj_b/filtered_contig.fasta"
 LIGHT = ("IGK", "IGL")
-# ponytail: the bundled mmseqs (abutils', commit 7e28409) dies in easy-cluster's prefilter on about 1.1M sequences
-# and passes 500k, so larger sets are clustered in a cascade of parts; one easy-cluster when mmseqs is fixed
-LIMIT = 500_000
 
 params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
 out = Path(sys.argv[1]).resolve()
@@ -130,28 +127,11 @@ def easy_cluster(seqs: dict, identity: float, dest: Path) -> dict:
     return {member: rep for rep, member in (line.split("\t") for line in tsv.read_text().splitlines())}
 
 
-def cascade(seqs: dict, identity: float, dest: Path) -> dict:
-    """Each id's representative. Over LIMIT sequences, the ids in contiguous parts of at most LIMIT are clustered
-    each, then their representatives are, and each id takes its representative's representative."""
-    if len(seqs) <= LIMIT:
-        return easy_cluster(seqs, identity, dest)
-    ids, parts = list(seqs), -(-len(seqs) // LIMIT)
-    size = -(-len(ids) // parts)
-    first = {}
-    for i in range(parts):
-        first.update(cascade({p: seqs[p] for p in ids[i * size:(i + 1) * size]}, identity, dest / f"part{i}"))
-    reps = sorted(set(first.values()))
-    if len(reps) >= len(seqs):
-        sys.exit(f"{dest}: clustering the parts left {len(reps)} of {len(seqs)}; the cascade cannot shrink it")
-    second = cascade({r: seqs[r] for r in reps}, identity, dest / "reps")
-    return {m: second[r] for m, r in first.items()}
-
-
 def cluster(pairs: pl.DataFrame, identity: float, dest: Path) -> pl.DataFrame:
     """pair_id and its representative's pair_id, clustering the heavy chain's sequence_vdj_aa joined to the
     light chain's."""
     seqs = {pid: h + l for pid, h, l in pairs.select("pair_id", "sequence_vdj_aa:0", "sequence_vdj_aa:1").iter_rows()}
-    reps = cascade(seqs, identity, dest)
+    reps = easy_cluster(seqs, identity, dest)
     return pl.DataFrame({"rep": list(reps.values()), "pair_id": list(reps)})
 
 
