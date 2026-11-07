@@ -49,7 +49,7 @@ Name the columns you need: each file holds some 340.
 
 ## Compute
 
-Measured by the first full build.
+One job, CPU only: 32 CPUs and 200G asked, on coreweave-rtx6000 `hpc-low` (Xeon Platinum 8562Y+). From nothing it takes about 4 h 20 min: the download (12 GB) 6 min; abstar and the pairing, sample by sample, 2 h 10 min; the 85% clustering of all 1,389,546 pairs 7 min; the 95% clustering of train's 1.33M 1 h 50 min. Peak memory 81 GB, in the annotation. Disk: 1.5 GB of files and 19 GB of stages under `<out>/.work/`, the tarball 12 GB of it; a rerun resumes from the last finished stage.
 
 ## Gotchas
 

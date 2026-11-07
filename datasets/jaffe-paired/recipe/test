@@ -6,7 +6,7 @@ from pathlib import Path
 
 import polars as pl
 
-FLOORS = {"train": 1, "eval": 1, "test": 1}  # rows; set to 90% of the first full build's
+FLOORS = {"train": 1_000_000, "eval": 1_200, "test": 4_300}  # rows: 90% of the first full build's, to two figures
 FRONT = ["pair_id", "sample", "donor", "flow_class", "cluster_85"]
 FIELDS = ["sequence_id", "locus", "productive", "v_call", "j_call", "sequence_vdj", "sequence_vdj_aa", "cdr3_aa", "fwr4_aa"]
 
