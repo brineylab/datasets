@@ -1,0 +1,187 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/build <out>: paired human antibodies from Jaffe et al. 2022 (figshare 19617633 v3), annotated with
+abstar, one heavy and one light chain per droplet, clustered with mmseqs2 at `identity`, split by cluster into
+train, eval, and test, train reduced at `train_identity`; written as <out>/{train,eval,test}.parquet.
+
+Stages under <out>/.work/, each skipped when a rerun finds it finished. Prints `dropped <why>: <n>` lines,
+then `pairs <split>: <n>` lines last.
+"""
+import hashlib
+import json
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tomllib
+import urllib.request
+from pathlib import Path
+
+import polars as pl
+
+# figshare file id: (name, size, MD5) of article 19617633 version 3
+SOURCE = {34846953: ("test_data.tar.gz", 11941014666, "4d87c4da2d407ba95180be2cb1c91044"),
+          34846938: ("test_data.csv", 1981, "3ccae335a8a03b5a771dc0eae97f7af6")}
+FASTA = "test_data/*/outs/per_sample_outs/*/vdj_b/filtered_contig.fasta"
+LIGHT = ("IGK", "IGL")
+
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+out = Path(sys.argv[1]).resolve()
+work = out / ".work"
+cpus = len(os.sched_getaffinity(0))  # the job's CPUs, not the node's
+
+
+def run(*cmd):
+    subprocess.run([str(c) for c in cmd], check=True, stdout=subprocess.DEVNULL)
+
+
+def download(dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    for fid, (name, size, md5) in SOURCE.items():
+        path = dest / name
+        if path.exists():
+            continue
+        part, h = path.with_suffix(".part"), hashlib.md5()
+        req = urllib.request.Request(f"https://ndownloader.figshare.com/files/{fid}", headers={"User-Agent": "brineylab-datasets"})
+        with urllib.request.urlopen(req) as r, open(part, "wb") as f:
+            for block in iter(lambda: r.read(1 << 22), b""):
+                h.update(block)
+                f.write(block)
+        if h.hexdigest() != md5 or part.stat().st_size != size:
+            part.unlink()
+            sys.exit(f"{fid}: MD5 {h.hexdigest()} is not {md5}")
+        part.rename(path)
+
+
+def extract(tarball: Path, dest: Path) -> None:
+    """Each sample's filtered_contig.fasta as dest/<sample>.fasta."""
+    if dest.exists():
+        return
+    tmp = dest.with_suffix(".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    run("tar", "-xzf", tarball, "-C", tmp, "--wildcards", FASTA)
+    for f in tmp.glob(FASTA):
+        f.rename(tmp / f"{f.parts[-6]}.fasta")
+    shutil.rmtree(tmp / "test_data")
+    tmp.rename(dest)
+
+
+def annotate(fasta: Path, dest: Path) -> Path:
+    """abstar's parquet for one sample, named <sample>.parquet."""
+    done = dest / f"{fasta.stem}.parquet"
+    if not done.exists():
+        tmp = dest.with_name(dest.name + ".tmp")
+        shutil.rmtree(tmp, ignore_errors=True)
+        run("abstar", "run", fasta, tmp, "--germline_database", params["germline_database"], "-o", "parquet",
+            "--n_processes", cpus, "--mmseqs_threads", cpus, "--no-copy-inputs")
+        dest.mkdir(parents=True, exist_ok=True)
+        (tmp / "parquet" / done.name).rename(done)
+        shutil.rmtree(tmp)
+    return done
+
+
+def pair(sample: str, fasta: Path, annotated: Path, dest: Path) -> dict:
+    """One row per droplet with one heavy and one light chain, both productive, as dest/<sample>.parquet;
+    returns the droplets dropped, by why."""
+    counts_path = dest / f"{sample}.json"
+    if counts_path.exists():
+        return json.loads(counts_path.read_text())
+    ids = [line[1:].split()[0] for line in fasta.read_text().splitlines() if line.startswith(">")]
+    ab = pl.read_parquet(annotated)
+    contigs = (pl.DataFrame({"sequence_id": ids})
+               .join(ab.select("sequence_id", "locus"), on="sequence_id", how="left")
+               .with_columns(pl.col("sequence_id").str.split("_").list.first().alias("barcode")))
+    shapes = (contigs.group_by("barcode")
+              .agg(pl.col("locus").is_null().sum().alias("unannotated"),
+                   (pl.col("locus") == "IGH").sum().alias("h"),
+                   pl.col("locus").is_in(LIGHT).sum().alias("l"))
+              .with_columns(pl.when(pl.col("unannotated") > 0).then(pl.lit("unannotated"))
+                            .otherwise(pl.format("{}H{}L", "h", "l")).alias("shape")))
+    counts = {k: v for k, v in shapes.group_by("shape").len().iter_rows() if k != "1H1L"}
+    keep = shapes.filter(pl.col("shape") == "1H1L").select("barcode")
+    chains = ab.with_columns(pl.col("sequence_id").str.split("_").list.first().alias("barcode")).join(keep, on="barcode")
+    heavy = chains.filter(pl.col("locus") == "IGH")
+    light = chains.filter(pl.col("locus").is_in(LIGHT))
+    pairs = heavy.rename({c: f"{c}:0" for c in ab.columns}).join(light.rename({c: f"{c}:1" for c in ab.columns}), on="barcode")
+    productive = pairs.filter(pl.col("productive:0") & pl.col("productive:1"))
+    counts["unproductive"] = pairs.height - productive.height
+    dest.mkdir(parents=True, exist_ok=True)
+    (productive.with_columns(pl.format("{}_{}", "barcode", pl.lit(sample)).alias("pair_id"), pl.lit(sample).alias("sample"))
+     .drop("barcode").write_parquet(dest / f"{sample}.parquet"))
+    counts_path.write_text(json.dumps(counts))
+    return counts
+
+
+def easy_cluster(seqs: dict, identity: float, dest: Path) -> dict:
+    """Each id's representative, mmseqs2 easy-cluster at `identity` and `coverage` of both sequences."""
+    tsv = dest / "clu_cluster.tsv"
+    if not tsv.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True)
+        with open(dest / "seqs.fasta", "w") as f:
+            f.writelines(f">{i}\n{s}\n" for i, s in seqs.items())
+        run("mmseqs", "easy-cluster", dest / "seqs.fasta", dest / "clu", dest / "tmp", "--min-seq-id", identity,
+            "-c", params["coverage"], "--cov-mode", 0, "--threads", cpus)
+        shutil.rmtree(dest / "tmp")
+    return {member: rep for rep, member in (line.split("\t") for line in tsv.read_text().splitlines())}
+
+
+def cluster(pairs: pl.DataFrame, identity: float, dest: Path) -> pl.DataFrame:
+    """pair_id and its representative's pair_id, clustering the heavy chain's sequence_vdj_aa joined to the
+    light chain's."""
+    seqs = {pid: h + l for pid, h, l in pairs.select("pair_id", "sequence_vdj_aa:0", "sequence_vdj_aa:1").iter_rows()}
+    reps = easy_cluster(seqs, identity, dest)
+    return pl.DataFrame({"rep": list(reps.values()), "pair_id": list(reps)})
+
+
+def main() -> None:
+    download(work / "download")
+    extract(work / "download" / "test_data.tar.gz", work / "fasta")
+    samples = pl.read_csv(work / "download" / "test_data.csv", infer_schema=False).rename({"dataset": "sample"})
+    samples = samples.with_columns(pl.col("donor").cast(pl.Int64))
+    if params["limit"]:
+        samples = samples.head(params["limit"])
+    dropped = {}
+    for sample in samples["sample"]:
+        fasta = work / "fasta" / f"{sample}.fasta"
+        for why, n in pair(sample, fasta, annotate(fasta, work / "abstar" / sample), work / "pairs").items():
+            dropped[why] = dropped.get(why, 0) + n
+    for why, n in sorted(dropped.items(), key=lambda kv: (kv[0] == "unproductive", -kv[1], kv[0])):
+        print(f"dropped {why}: {n}")
+    pairs = pl.concat([pl.read_parquet(work / "pairs" / f"{s}.parquet") for s in samples["sample"]], how="diagonal_relaxed")
+    pairs = pairs.join(samples, on="sample")
+    print(f"pairs kept: {pairs.height}")
+
+    c85 = cluster(pairs, params["identity"], work / "mm85").rename({"rep": "cluster_85"})
+    sizes = dict(c85.group_by("cluster_85").len().iter_rows())
+    reps = sorted(sizes)
+    random.Random(params["seed"]).shuffle(reps)
+    total, (f_train, f_eval, _) = pairs.height, params["split"]
+    assigned, n_train, n_eval = {}, 0, 0
+    for rep in reps:
+        if n_train < f_train * total:
+            assigned[rep], n_train = "train", n_train + sizes[rep]
+        elif n_eval < f_eval * total:
+            assigned[rep], n_eval = "eval", n_eval + sizes[rep]
+        else:
+            assigned[rep] = "test"
+    split = pl.DataFrame({"cluster_85": list(assigned), "split": list(assigned.values())})
+    pairs = pairs.join(c85, on="pair_id").join(split, on="cluster_85")
+
+    front = ["pair_id", "sample", "donor", "flow_class", "cluster_85"]
+    chains = [c for c in pairs.columns if c.endswith((":0", ":1"))]
+    train = pairs.filter(pl.col("split") == "train")
+    c95 = cluster(train, params["train_identity"], work / "mm95").rename({"rep": "cluster_95"})
+    train = train.join(c95, on="pair_id").filter(pl.col("pair_id") == pl.col("cluster_95"))
+    files = {"train": train.select(*front, "cluster_95", *chains)}
+    for name in ("eval", "test"):
+        files[name] = pairs.filter((pl.col("split") == name) & (pl.col("pair_id") == pl.col("cluster_85"))).select(*front, *chains)
+    for name, df in files.items():
+        df.sort("pair_id").write_parquet(out / f"{name}.parquet")
+    for name, df in files.items():
+        print(f"pairs {name}: {df.height}")
+
+
+if __name__ == "__main__":
+    main()
