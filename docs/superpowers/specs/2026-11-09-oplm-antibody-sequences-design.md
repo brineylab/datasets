@@ -84,7 +84,7 @@ test_gte2.parquet                       5,000
   - uniref70's 100,000 rows would make about 5,000 files and some 70 GB, through `scripts/push`'s single `upload_folder` commit.
   - 1,000,000 rows makes about 500 files. OPLM's loader doesn't care.
 - **Column types.** As uniref70's: `sequence_id` and `sequence` are strings; `member_ids` and `member_sequences` are lists of strings, non-empty and the same length (OPLM's loader requires both).
-- **Order.** Each train set is written in a seeded global shuffle, as uniref70 is. OPLM's loader expects shuffled shards. Pilot runs that subsample (oplm#78 uses 1/35 of the source to keep production pass counts) can then take any subset of shards as a uniform sample.
+- **Order.** Each train set is written in a seeded global shuffle, as uniref70 is: rows ordered by `md5('<seed>:<sequence_id>')`, which is stable across tools and versions and sorts out of core **(call)**. OPLM's loader expects shuffled shards. Pilot runs that subsample (oplm#78 uses 1/35 of the source to keep production pass counts) can then take any subset of shards as a uniform sample.
 
 ## 6. Steps
 
@@ -101,7 +101,7 @@ ANARCII (2.0.8) ships its model weights inside the package, so it downloads noth
 1. **Download** both files and check their MD5s.
 2. **Hold out.**
    - Each AntiRef90 cluster's size is its number of manifest rows (AntiRef100 sequences). A singleton has one; gte2 has two or more **(call)**.
-   - The distinct AntiRef90 IDs, sorted, are shuffled with `random.Random(seed)`, jaffe-paired's convention. Walk them in that order, each stratum separately.
+   - The distinct AntiRef90 IDs are put in the same seeded order, `md5('<seed>:<antiref90 id>')`, rather than jaffe-paired's `random.Random(seed)` over a list: about 150M IDs sort out of core this way **(call)**. Walk them in that order, each stratum separately.
    - Number each candidate's representative with ANARCII, IMGT scheme. Keep a candidate only if:
      - its chain type is H, K, or L;
      - every residue of `sequence` is numbered;
