@@ -77,7 +77,8 @@ def main() -> int:
         # an earlier candidate of this tree: replaced, so the record's commit holds exactly this output
         api.delete_branch(repo, branch=branch, repo_type="dataset")
     api.create_branch(repo, branch=branch, revision="main", repo_type="dataset")
-    api.upload_folder(folder_path=out, repo_id=repo, repo_type="dataset", revision=branch, ignore_patterns=HIDDEN,
+    # the branch starts from main, which holds the last version promoted: what this output lacks goes
+    api.upload_folder(folder_path=out, repo_id=repo, repo_type="dataset", revision=branch, ignore_patterns=HIDDEN, delete_patterns="*",
                       commit_message=f"{name} {meta['version']}: the output of recipe tree {tree}")
     head = api.upload_file(path_or_fileobj=card(dataset / "SKILL.md").encode(), path_in_repo="README.md", repo_id=repo,
                            repo_type="dataset", revision=branch, commit_message=f"{name} {meta['version']}: the card")

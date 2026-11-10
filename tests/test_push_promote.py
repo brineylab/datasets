@@ -46,6 +46,13 @@ class PushPromoteTests(unittest.TestCase):
         self.assertEqual(s["uploaded"], ["eval.txt", "train.txt"])  # not .work/
         self.assertIn(["upload_file", "README.md"], s["calls"]); self.assertNotIn("hf_test", r.stdout + r.stderr)
 
+    def test_push_over_a_published_version_holds_only_the_new_output(self):
+        # main holds the last version promoted, and a candidate branches from it
+        self.hub.write_text(json.dumps({"branches": {"main": "m" * 40}, "trees": {"m" * 40: {".gitattributes": "g", "old.parquet": "o", "README.md": "r"}}}))
+        self.assertEqual(self.run_script("scripts/push", "tiny", self.out).returncode, 0)
+        s = self.state()
+        self.assertEqual(sorted(s["trees"][s["branches"][self.branch]]), [".gitattributes", "README.md", "eval.txt", "train.txt"])
+
     def test_push_of_a_new_candidate_creates_its_branch_without_deleting_one(self):
         self.assertEqual(self.run_script("scripts/push", "tiny", self.out).returncode, 0)
         self.assertEqual([c[0] for c in self.state()["calls"][:3]], ["create_repo", "list_repo_refs", "create_branch"])
@@ -137,6 +144,17 @@ class PushPromoteTests(unittest.TestCase):
         self.assertEqual(s["tags"]["v1.0.0"], "c" * 40); self.assertNotIn(self.branch, s["branches"])
         self.assertEqual(r.stdout.splitlines()[-1], f"promoted: {ORG}/tiny v1.0.0 at {'c' * 40}")
 
+    def test_promote_gives_main_the_versions_files(self):
+        trees = {"m" * 40: {".gitattributes": "g", "old.parquet": "o", "README.md": "r0"},
+                 "c" * 40: {".gitattributes": "g", "eval.txt": "e", "README.md": "r1"}}
+        self.hub.write_text(json.dumps({"branches": {"main": "m" * 40, self.branch: "c" * 40}, "trees": trees}))
+        self.record("c" * 40)
+        r = self.run_script("scripts/promote", "tiny", "1.0.0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.state()
+        self.assertEqual(s["trees"][s["branches"]["main"]], trees["c" * 40]); self.assertEqual(s["tags"]["v1.0.0"], "c" * 40)
+        self.assertEqual(r.stdout.splitlines()[-1], f"promoted: {ORG}/tiny v1.0.0 at {'c' * 40}")
+
     def test_promote_never_moves_an_existing_tag(self):
         self.hub.write_text(json.dumps({"branches": {self.branch: "c" * 40}, "tags": {"v1.0.0": "x" * 40}}))
         self.record("c" * 40)
@@ -145,10 +163,20 @@ class PushPromoteTests(unittest.TestCase):
         self.assertEqual(self.state()["tags"]["v1.0.0"], "x" * 40); self.assertIn(self.branch, self.state()["branches"])
 
     def test_promote_run_again_after_it_succeeded_passes(self):
-        self.hub.write_text(json.dumps({"tags": {"v1.0.0": "c" * 40}}))
+        trees = {"m" * 40: {"eval.txt": "e"}, "c" * 40: {"eval.txt": "e"}}
+        self.hub.write_text(json.dumps({"branches": {"main": "m" * 40}, "tags": {"v1.0.0": "c" * 40}, "trees": trees}))
         self.record("c" * 40)
         r = self.run_script("scripts/promote", "tiny", "1.0.0")
         self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("already promoted", r.stdout)
+        self.assertEqual(self.state()["branches"]["main"], "m" * 40)  # main already held the version: no commit
+
+    def test_promote_of_a_version_published_before_main_followed_moves_main(self):
+        trees = {"m" * 40: {".gitattributes": "g"}, "c" * 40: {".gitattributes": "g", "eval.txt": "e"}}
+        self.hub.write_text(json.dumps({"branches": {"main": "m" * 40}, "tags": {"v1.0.0": "c" * 40}, "trees": trees}))
+        self.record("c" * 40)
+        r = self.run_script("scripts/promote", "tiny", "1.0.0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = self.state(); self.assertEqual(s["trees"][s["branches"]["main"]], trees["c" * 40])
 
 if __name__ == "__main__":
     unittest.main()

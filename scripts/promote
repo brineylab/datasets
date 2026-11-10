@@ -1,11 +1,12 @@
 #!/usr/bin/env -S python3 -I
 """scripts/promote <name> <version>: tag the commit results/<name>/<version>.txt names as v<version> on
-<org>/<name>, then delete the candidate branch. Whoever merges the dataset's pull request runs it after
-pulling main, with their own HF_TOKEN; a record that is not on origin/main as it is here is refused, so only
+<org>/<name>, give main the version's files, then delete the candidate branch. Whoever merges the dataset's
+pull request runs it after pulling main, with their own HF_TOKEN; a record that is not on origin/main as it is here is refused, so only
 a reviewed, merged record is published (a guard against mistakes, not misuse: an org token can tag
 the Hub directly). Run it from a full clone: a worktree's .git points outside a mounted directory. A tag is never moved: one already naming another commit exits 1;
-one already naming the record's commit passes, so a promote run again after it succeeded passes. The last
-line of stdout says what happened.
+one already naming the record's commit passes, so a promote run again after it succeeded passes. main
+becomes a copy of the version, one commit on it, so the Hub's page and viewer show the version last promoted;
+the tag stays the version anyone names. The last line of stdout says what happened.
 """
 import os
 import subprocess
@@ -14,8 +15,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check  # noqa: E402
-from huggingface_hub import HfApi  # noqa: E402
+from huggingface_hub import CommitOperationCopy, CommitOperationDelete, HfApi  # noqa: E402
 from huggingface_hub.errors import HfHubHTTPError  # noqa: E402
+
+
+def follow(api: HfApi, repo: str, tag: str, commit: str, main_head: str) -> None:
+    """main gets commit's files in one commit, copied on the Hub, or nothing when it holds them already."""
+    def tree(rev):
+        return {f.path: f.blob_id for f in api.list_repo_tree(repo, revision=rev, recursive=True, repo_type="dataset") if hasattr(f, "blob_id")}
+    have, want = tree(main_head), tree(commit)
+    ops = [CommitOperationDelete(p) for p in have if p not in want]
+    ops += [CommitOperationCopy(src_path_in_repo=p, path_in_repo=p, src_revision=commit) for p, b in want.items() if have.get(p) != b]
+    if ops:
+        api.create_commit(repo, ops, commit_message=f"main <- {tag}", revision="main", parent_commit=main_head, repo_type="dataset")
 
 
 def main() -> int:
@@ -33,12 +45,14 @@ def main() -> int:
     rec = check.parse_record(check.ROOT / rel)
     repo, tag, commit = f"{check.hub_org()}/{name}", f"v{version}", rec["commit"]
     api = HfApi(token=os.environ["HF_TOKEN"])
-    have = {t.name: t.target_commit for t in api.list_repo_refs(repo, repo_type="dataset").tags}
+    refs = api.list_repo_refs(repo, repo_type="dataset")
+    have = {t.name: t.target_commit for t in refs.tags}
     if tag in have and have[tag] != commit:
         print(f"{repo} {tag} already exists at {have[tag]}, not the record's {commit}; a published tag is never moved", file=sys.stderr)
         return 1
     if tag not in have:
         api.create_tag(repo, tag=tag, revision=commit, repo_type="dataset")
+    follow(api, repo, tag, commit, next(b.target_commit for b in refs.branches if b.name == "main"))
     try:
         api.delete_branch(repo, branch=rec["branch"], repo_type="dataset")
     except HfHubHTTPError as e:
