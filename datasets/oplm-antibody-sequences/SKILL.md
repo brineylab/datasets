@@ -99,6 +99,7 @@ Measured on the first full build, on a workstation under podman with 16 CPUs and
 
 ## Gotchas
 
+- **Zenodo is slow to CoreWeave.** On 2026-11-10 it served CoreWeave at 5–7 KB/s per connection and the Scripps network at about 520 KB/s, while CoreWeave reached other hosts at hundreds of MB/s. The 32.5 GB download would take about two days on CoreWeave, so build on bcr.
 - **Held out by AntiRef90 cluster membership only.** No identity screen was run.
   - A train sequence can share a held-out sequence's V gene and a similar CDR3 at under 90% identity.
   - Because linclust is greedy and nested over six levels, a train sequence can even be 90% or more identical to a held-out representative and sit in another AntiRef90 cluster.
