@@ -3,7 +3,7 @@ name: jaffe-paired
 description: "Paired human antibody heavy and light chains from four donors' sorted B cells (Jaffe et al. 2022), annotated with abstar, clustered at 85% identity and split by cluster, train reduced at 95%. Reach for it to train or evaluate a paired-chain antibody model."
 metadata:
   version: 1.0.0
-  tools: datascience@1.1.0
+  tools: datascience@1.2.0
   license: mit
 ---
 # jaffe-paired
@@ -35,11 +35,11 @@ Name the columns you need: each file holds some 340.
 
 **Source:** Jaffe et al. 2022, figshare article 19617633 version 3 (DOI `10.6084/m9.figshare.19617633.v3`, MIT), pulled 2026-11-06: `test_data.tar.gz` (file 34846953, MD5 `4d87c4da2d407ba95180be2cb1c91044`), of which each sample's Cell Ranger `vdj_b/filtered_contig.fasta` (cell-associated contigs, productive, high-confidence, and full-length by Cell Ranger), and `test_data.csv` (file 34846938, MD5 `3ccae335a8a03b5a771dc0eae97f7af6`), the 94 samples' donors and flow classes. The recipe refuses a download whose MD5 differs.
 
-**Steps**, one job in `datascience@1.1.0`:
+**Steps**, one job in `datascience@1.2.0`:
 
 1. Annotate every contig with abstar 0.9.0 (`germline_database = "human"`). 0.9.0 matters: it writes `sequence_vdj_aa`, the variable domain, which the clustering uses; in 0.9.0 `sequence_aa` is the translated input, as AIRR 2.0 defines it.
 2. Pair within each sample: a droplet's barcode is the contig id up to its first underscore. Keep a droplet only with exactly one heavy chain (`IGH`) and one light (`IGK` or `IGL`), both productive by abstar. The build prints what it dropped, by shape (`dropped 1H2L: <n>`) and for productivity (`dropped unproductive: <n>`); the record carries those lines.
-3. Cluster every pair with `mmseqs easy-cluster --min-seq-id 0.85 -c 0.8 --cov-mode 0` (`identity`, `coverage`; 80% of both sequences) on the heavy chain's `sequence_vdj_aa` joined to the light chain's. One `easy-cluster` run over every pair: `datascience@1.1.0`'s mmseqs (master, commit 2a3dafc) carries the fix to the prefilter overflow (MMseqs2 #1092) that kills release 18 and abutils' bundled build on about 1.1M of these sequences.
+3. Cluster every pair with `mmseqs easy-cluster --min-seq-id 0.85 -c 0.8 --cov-mode 0` (`identity`, `coverage`; 80% of both sequences) on the heavy chain's `sequence_vdj_aa` joined to the light chain's. One `easy-cluster` run over every pair: `datascience@1.2.0`'s mmseqs (master, commit 2a3dafc) carries the fix to the prefilter overflow (MMseqs2 #1092) that kills release 18 and abutils' bundled build on about 1.1M of these sequences.
 4. Split by cluster `[0.96, 0.02, 0.02]`: the representatives, sorted, are shuffled with `random.Random(seed = 1)`, and whole clusters go to train until it holds 96% of the pairs, then to eval until 2%, then to test. No 85% cluster spans two splits. Eval and test keep the 85% representatives.
 5. Re-cluster every train pair at 95% (`train_identity`), the same way; train keeps the 95% representatives.
 
