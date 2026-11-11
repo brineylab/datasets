@@ -12,7 +12,7 @@ Hub: `brineylab/uniref90`, tag `v1.0.0`
 
 ## Files
 
-`data/00000.parquet` … `data/00125.parquet`: 126 shards holding 125,724,408 rows, one row per UniRef90 entry, in the FASTA's order. Every shard but the last holds exactly 1,000,000 rows (the last 224,408); zstd, row groups of about 100,000 rows. Columns:
+`data/00000.parquet` … `data/00125.parquet`: 126 shards holding 125,724,408 rows, one row per UniRef90 entry, in the FASTA's order. Every shard but the last holds exactly 1,000,000 rows (the last 724,408); zstd, row groups of about 100,000 rows. Columns:
 
 - `sequence_id`: the FASTA header's first token, the entry id (`UniRef90_A0A5A9P0L4`).
 - `sequence`: the entry's amino acids, its lines after the header joined.
