@@ -1,0 +1,6 @@
+release = "2026_04"
+url = "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"
+bytes = 32692271968
+md5 = "9410e1bb6269000a1b1c332854c75322"
+sequences = 125724408
+shard_rows = 1000000
