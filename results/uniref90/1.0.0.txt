@@ -3,12 +3,12 @@ dataset: uniref90
 version: 1.0.0
 hub: brineylab/uniref90
 branch: candidate-c1ba4f4c5d2e72f4e7b8731078da60197ad01924
-commit: 3a7f6d6bb1961be9ad56989f31165c2892d223b5
+commit: 0a74e637bd557ed275864271ffd6fb313f8dd7db
 tree: c1ba4f4c5d2e72f4e7b8731078da60197ad01924
 tools: datascience@1.2.0
 runner: sbatch --partition=cpu --cpus-per-task=8 --mem=32G --time=04:00:00
 host: bcr.scripps.edu
-started: 2026-11-11T03:22:35Z
+started: 2026-11-11T04:14:35Z
 exit: 0
 ---
 pyxis: importing docker image: ghcr.io#brineylab/toolshed/datascience:1.2.0
@@ -144,4 +144,4 @@ file data/00122.parquet 39347515 8f0d9ac4b8d9213f899553fc7a7f94b40533f528a6338f9
 file data/00123.parquet 36447332 a2772ff9f3bea7e0317e3a5c87209709a232e0e70bea9905b52fb35fb1f9889b
 file data/00124.parquet 32565083 bd8a9464944bb77fb0bece509fea67e0de1f1627b217756e18450a8aee964366
 file data/00125.parquet 18772323 d3df32f9197eb12f194a04f26b665aae43daa505ae8a144ba888ac2b5ca99be5
-commit: 3a7f6d6bb1961be9ad56989f31165c2892d223b5
+commit: 0a74e637bd557ed275864271ffd6fb313f8dd7db
