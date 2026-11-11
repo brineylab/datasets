@@ -54,7 +54,7 @@ One job, CPU only: 32 CPUs and 200G asked, on coreweave-rtx6000 `hpc-low` (Xeon 
 ## Gotchas
 
 - Barcodes are unique only within a sample; `pair_id` carries the sample for that reason.
-- The droplet rule drops about 9% of droplets (sample 1279049: 389 with two lights, 299 with two of each, 49 with two heavies, 118 with one chain, of 9,808).
+- The droplet rule drops about 13% of droplets by shape (215,163 of 1,618,287 across the 94 samples) and 13,578 more for productivity. The rate varies by sample: 1279049's is 8.7% (389 with two lights, 299 with two of each, 49 with two heavies, 118 with one chain, of 9,808).
 - Eval and test hold one pair per 85% cluster, so they are far fewer rows than 2% of the pairs: they are cluster-level held-out sets.
 - `donor` makes a held-out-donor split possible; that is another dataset, a copy of this one with the split changed.
 - With podman on a laptop, run with `--pids-limit=-1`: abstar's workers pass podman's default limit of 2048 threads.
