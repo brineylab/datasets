@@ -1,0 +1,133 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/build <out>: UniRef50 of UniProt release 2026_04 as sharded two-column parquet. Downloads
+uniref50.fasta.gz into <out>/.work/, refusing a size or MD5 that differs from params, then streams it, never
+holding the whole file in memory, into <out>/data/00000.parquet, 00001.parquet, ...: the FASTA's order,
+shard_rows rows per shard (the last one partial), zstd, row groups of about 100k rows. sequence_id is the
+header's first token, sequence the amino acids of the header's lines joined. Stages resume: a rerun keeps
+the verified FASTA and the shards already written. Prints the shard and row totals last.
+"""
+import gzip
+import hashlib
+import os
+import sys
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+out = Path(sys.argv[1]).resolve()
+work, data = out / ".work", out / "data"
+SCHEMA = pa.schema([("sequence_id", pa.string()), ("sequence", pa.string())])
+
+
+def shard_paths() -> list[Path]:
+    """data/'s shards in order; a gap ends the list, so a partial build resumes at its end."""
+    paths, i = [], 0
+    while (data / f"{i:05d}.parquet").is_file():
+        paths.append(data / f"{i:05d}.parquet")
+        i += 1
+    return paths
+
+
+def rows(paths: list[Path]) -> int:
+    return sum(pq.ParquetFile(p).metadata.num_rows for p in paths)
+
+
+def download() -> Path:
+    """The FASTA in .work/, resumed by range from where a partial one stopped and given three attempts at
+    a connection; refuses a size or MD5 that differs from params."""
+    name = params["url"].rsplit("/", 1)[-1]
+    path, part = work / name, Path(f"{work / name}.part")
+    if path.is_file():
+        return path
+    for attempt in range(3):
+        have = part.stat().st_size if part.exists() else 0
+        if have >= params["bytes"]:
+            break
+        try:
+            headers = {"User-Agent": "brineylab-datasets"}
+            if have:
+                headers["Range"] = f"bytes={have}-"
+            request = urllib.request.Request(params["url"], headers=headers)
+            with urllib.request.urlopen(request, timeout=120) as r, open(part, "ab") as f:
+                if have and r.status != 206:
+                    sys.exit(f"{params['url']} answered {r.status} to a range request at {have} bytes")
+                while block := r.read(1 << 22):
+                    f.write(block)
+            break
+        except OSError as e:
+            if attempt == 2:
+                raise
+            print(f"{name}: {e}; retrying from {part.stat().st_size} bytes", file=sys.stderr)
+            time.sleep(30)
+    if part.stat().st_size != params["bytes"]:
+        sys.exit(f"{name}: {part.stat().st_size} bytes is not {params['bytes']}")
+    digest = hashlib.md5()
+    with open(part, "rb") as f:
+        while block := f.read(1 << 24):
+            digest.update(block)
+    if digest.hexdigest() != params["md5"]:
+        sys.exit(f"{name}: MD5 {digest.hexdigest()} is not {params['md5']}")
+    part.rename(path)
+    return path
+
+
+def records(gz: Path):
+    """(sequence_id, sequence) per FASTA record, in the file's order; the whole file is never held."""
+    with gzip.open(gz, "rt", encoding="ascii") as f:
+        sid, parts = None, []
+        for line in f:
+            if line.startswith(">"):
+                if sid is not None:
+                    yield sid, "".join(parts)
+                sid, parts = line[1:].split(None, 1)[0], []
+            else:
+                parts.append(line.rstrip())
+        if sid is not None:
+            yield sid, "".join(parts)
+
+
+def write(i: int, ids: list[str], seqs: list[str]) -> None:
+    """Shard i whole or not at all: written under .work/ then moved into data/."""
+    pq.write_table(pa.table({"sequence_id": ids, "sequence": seqs}, schema=SCHEMA), work / "shard.part",
+                   row_group_size=100_000, compression="zstd")
+    os.replace(work / "shard.part", data / f"{i:05d}.parquet")
+
+
+def shard(gz: Path, first: int) -> None:
+    """data/'s shards from first on, in the FASTA's order, skipping the rows of the shards already there."""
+    data.mkdir(parents=True, exist_ok=True)
+    skip = first * params["shard_rows"]
+    i, ids, seqs = first, [], []
+    for sid, seq in records(gz):
+        if skip:
+            skip -= 1
+            continue
+        ids.append(sid)
+        seqs.append(seq)
+        if len(ids) == params["shard_rows"]:
+            write(i, ids, seqs)
+            i, ids, seqs = i + 1, [], []
+    if ids:
+        write(i, ids, seqs)
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        sys.exit(f"usage: {Path(sys.argv[0]).name} <out>")
+    out.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    paths = shard_paths()
+    if rows(paths) != params["sequences"]:
+        shard(download(), len(paths))
+        paths = shard_paths()
+    print(f"shards: {len(paths)}")
+    print(f"rows: {rows(paths)}")
+
+
+if __name__ == "__main__":
+    main()
