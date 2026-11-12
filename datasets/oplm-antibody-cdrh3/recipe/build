@@ -1,11 +1,12 @@
 #!/usr/bin/env -S python3 -I
-"""recipe/build <out>: OPLM's antibody sequences from AntiRef v2022.12.14 (Zenodo 7474336 and 7474658). Held-out
-AntiRef90 clusters, singletons and gte2, are numbered with ANARCII and written as eval and test with `locus` and an
-abstar-format `cdr_mask_aa`; every other cluster goes to two train sets, AntiRef96 clusters with their AntiRef99
-members and AntiRef99 representatives, sharded as OPLM's uniref70 and deepclust70 are.
+"""recipe/build <out>: OPLM's antibody sequences from AntiRef v2022.12.14 (Zenodo 7474336 and 7474658), with a
+heavy-chain CDR3-identity holdout. oplm-antibody-sequences v1.0.0's held-out AntiRef90 clusters come out unchanged. Then
+10,000 more heavy-chain AntiRef90 representatives, their CDR3s mutually under 80% identical, are eval_cdrh3 and
+test_cdrh3, and every AntiRef99 sequence carrying one of those CDR3s at 80% identity or more is screened out of train.
+What remains is written as AntiRef90, 92, 94 and 96 clusters with their AntiRef99 members, sharded as OPLM's uniref70.
 
-Stages under <out>/.work/, each skipped when a rerun finds it finished. Prints `held out failed numbering` lines,
-then `rows` and `locus` lines last.
+Stages under <out>/.work/, each skipped when a rerun finds it finished. Runs a self-check first (`--selfcheck` alone
+stops there). Prints `held out failed numbering`, `cdrh3` and `screen` lines, then `rows`, `members` and `locus` lines.
 """
 import collections
 import gzip
@@ -33,6 +34,7 @@ SOURCE = {"antiref_cluster-manifest.csv.gz": (7474336, 14054641207, "18fcf637670
 STREAMS = 32
 LEVELS = ["antiref100", "antiref99", "antiref98", "antiref96", "antiref94", "antiref92", "antiref90"]
 REGIONS = [(27, 38, "1"), (56, 65, "2"), (105, 117, "3")]  # IMGT; everything else is framework, 0
+TRAIN_LEVELS = ["antiref90", "antiref92", "antiref94", "antiref96"]
 LOCI = {"H": "IGH", "K": "IGK", "L": "IGL"}
 STRATA = {"singletons": "size = 1", "gte2": "size >= 2"}
 # a heavy chain whose IMGT regions are FWR1 25, CDR1 8, FWR2 17, CDR2 8, FWR3 38, CDR3 21 (with insertions), FWR4 11
@@ -151,6 +153,13 @@ def selfcheck() -> None:
     assert screened_by(idx, KNOWN[0]) == 7
     assert anchored(loose) == [] and screened_by(idx, loose) == 7
     assert screened_by(idx, KNOWN[0].replace(q, "AKDLGGNWFDP")) is None
+    assert promote("antiref90", "A", "A", False) == "A"
+    assert promote("antiref90", "A", "B", True) == "B"  # the screen took the representative: its first survivor leads
+    try:
+        promote("antiref90", "A", "B", False)
+        raise AssertionError("a broken nesting passed")
+    except SystemExit:
+        pass
 
 
 def fetch_range(url: str, part: Path, lo: int, hi: int) -> None:
@@ -360,47 +369,62 @@ def write_shards(batches: pa.RecordBatchReader, folder: Path, shard_rows: int) -
     tmp.rename(folder)
 
 
-def clusters(reader: pa.RecordBatchReader):
-    """One row per AntiRef96 cluster from rows (antiref96, antiref99, sequence) sorted so that each cluster's rows are
-    together, its representative first. A batch's last cluster may go on in the next batch, so it waits for it."""
+def promote(level: str, level_id: str, first_member: str, rep_removed: bool) -> str:
+    """A cluster row's sequence_id: its representative, or, when the screen removed that, its first surviving member.
+    A representative that survived but is not its own first member means the nesting broke, and the build stops."""
+    if first_member != level_id and not rep_removed:
+        sys.exit(f"{level} representative {level_id} is not among its own AntiRef99 members")
+    return first_member
+
+
+def clusters(reader: pa.RecordBatchReader, level: str):
+    """One row per `level` cluster from rows (level, antiref99, sequence, rep_removed) sorted so that each cluster's
+    rows are together, its representative first when it survived. A batch's last cluster may go on in the next batch,
+    so it waits for it."""
     held = reader.schema.empty_table()
     for batch in itertools.chain(reader, [None]):
         t = held if batch is None else pa.concat_tables([held, pa.Table.from_batches([batch])]).combine_chunks()
         if not t.num_rows:
             continue
-        c = t["antiref96"].combine_chunks()
+        c = t[level].combine_chunks()
         starts = [0, *pc.add(pc.indices_nonzero(pc.not_equal(c[1:], c[:-1])), 1).to_pylist()]
         end = t.num_rows if batch is None else starts.pop()
         held, t = t.slice(end), t.slice(0, end)
         if not starts:
             continue
         ids, seqs, offsets = t["antiref99"].combine_chunks(), t["sequence"].combine_chunks(), pa.array([*starts, end], pa.int32())
-        stray = pc.not_equal(c.take(starts), ids.take(starts))
-        if pc.any(stray).as_py():
-            sys.exit(f"AntiRef96 representative {c.take(starts).filter(stray)[0]} is not among its own AntiRef99 members")
-        yield pa.record_batch({"sequence_id": c.take(starts), "sequence": seqs.take(starts),
+        reps, firsts, removed = c.take(starts), ids.take(starts), t["rep_removed"].combine_chunks().take(starts)
+        for i in pc.indices_nonzero(pc.not_equal(reps, firsts)).to_pylist():
+            promote(level, reps[i].as_py(), firsts[i].as_py(), removed[i].as_py())
+        yield pa.record_batch({"sequence_id": firsts, "sequence": seqs.take(starts),
                                "member_ids": pa.ListArray.from_arrays(offsets, ids),
                                "member_sequences": pa.ListArray.from_arrays(offsets, seqs)})
 
 
 def train(work: Path, shard_rows: int) -> None:
-    """Every manifest row outside the held-out AntiRef90 clusters, as AntiRef96 clusters with their AntiRef99 members
-    (representative first) and as AntiRef99 representatives, each in the seeded order."""
+    """The AntiRef99 sequences outside the held-out AntiRef90 clusters and outside the screen, as clusters at each of
+    TRAIN_LEVELS with their AntiRef99 members (representative, or its first survivor, first), in the seeded order."""
     con = connect()
     con.execute(f"CREATE VIEW kept AS SELECT * FROM '{work / 'manifest.parquet'}' ANTI JOIN '{work / 'heldout.parquet'}' h "
-                f"USING (antiref90)")
+                f"USING (antiref90) ANTI JOIN '{work / 'screened.parquet'}' r USING (antiref99)")
     con.execute(f"CREATE VIEW seqs AS SELECT * FROM '{work / 'sequences.parquet'}'")
-    if not (out / "antiref99" / "train").is_dir():
-        write_shards(con.sql(f"SELECT d.antiref99 AS sequence_id, s.sequence FROM (SELECT DISTINCT antiref99 FROM kept) d "
-                             f"JOIN seqs s ON s.sequence_id = d.antiref99 ORDER BY {order('d.antiref99')}").to_arrow_reader(),
-                     out / "antiref99" / "train", shard_rows)
-    if not (out / "antiref96" / "train").is_dir():
+    members = {}
+    for level in TRAIN_LEVELS:
+        members[level] = con.sql(f"SELECT count(*) FROM (SELECT DISTINCT {level}, antiref99 FROM kept)").fetchall()[0][0]
+        if (out / level / "train").is_dir():
+            continue
         # one sort and a streaming group: an ordered list() over 300M sequences spilled 90 GB and stalled
-        rows = con.sql(f"SELECT m.antiref96, m.antiref99, s.sequence FROM (SELECT DISTINCT antiref96, antiref99 FROM kept) m "
-                       f"JOIN seqs s ON s.sequence_id = m.antiref99 "
-                       f"ORDER BY {order('m.antiref96')}, m.antiref96, m.antiref99 = m.antiref96 DESC, {order('m.antiref99')}")
-        write_shards(clusters(rows.to_arrow_reader()), out / "antiref96" / "train", shard_rows)
-
+        rows = con.sql(f"SELECT m.{level}, m.antiref99, s.sequence, r.antiref99 IS NOT NULL AS rep_removed "
+                       f"FROM (SELECT DISTINCT {level}, antiref99 FROM kept) m JOIN seqs s ON s.sequence_id = m.antiref99 "
+                       f"LEFT JOIN '{work / 'screened.parquet'}' r ON r.antiref99 = m.{level} "
+                       f"ORDER BY {order(f'm.{level}')}, m.{level}, m.antiref99 = m.{level} DESC, {order('m.antiref99')}")
+        write_shards(clusters(rows.to_arrow_reader(), level), out / level / "train", shard_rows)
+    if len(set(members.values())) != 1:
+        sys.exit(f"member totals differ across levels: {members}")
+    for level in TRAIN_LEVELS:
+        rows = con.sql(f"SELECT count(*) FROM '{out / level / 'train'}/*.parquet'").fetchall()[0][0]
+        print(f"rows {level}/train: {rows}")
+        print(f"members {level}/train: {members[level]} mean {members[level] / rows:.2f}")
 
 selfcheck()
 if sys.argv[1:] == ["--selfcheck"]:
@@ -421,11 +445,8 @@ if not (work / "screened.parquet").is_file():
 train(work, params["shard_rows"])
 
 con = connect()
-for folder in ("antiref96", "antiref99"):
-    print(f"rows {folder}/train: {con.sql(f"SELECT count(*) FROM '{out / folder / 'train'}/*.parquet'").fetchall()[0][0]}")
-for name in ("eval", "test"):
-    for s in STRATA:
-        path = out / f"{name}_{s}.parquet"
-        print(f"rows {path.name}: {pq.ParquetFile(path).metadata.num_rows}")
-        for locus, count in con.sql(f"SELECT locus, count(*) FROM '{path}' GROUP BY locus ORDER BY locus").fetchall():
-            print(f"locus {path.name} {locus}: {count}")
+for name in [f"{n}_{st}" for n in ("eval", "test") for st in STRATA] + ["eval_cdrh3", "test_cdrh3"]:
+    path = out / f"{name}.parquet"
+    print(f"rows {path.name}: {pq.ParquetFile(path).metadata.num_rows}")
+    for locus, count in con.sql(f"SELECT locus, count(*) FROM '{path}' GROUP BY locus ORDER BY locus").fetchall():
+        print(f"locus {path.name} {locus}: {count}")
