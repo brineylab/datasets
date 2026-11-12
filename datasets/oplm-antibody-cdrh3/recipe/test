@@ -1,24 +1,63 @@
 #!/usr/bin/env -S python3 -I
-"""recipe/test <out>: exit 0 iff <out> holds a version of oplm-antibody-sequences. Reads parquet footers, the four
-held-out files, and the first and last shard of each train folder; one line per failure, naming the check and the
-first offending sequence_id."""
+"""recipe/test <out>: exit 0 iff <out> holds a version of oplm-antibody-cdrh3. Reads parquet footers, the six held-out
+files, and the first and last shard of each train folder; checks the CDR3 holdout's 80% separation and, on sampled
+train members, that the screen holds, with its own matching code (DuckDB's levenshtein and a q-gram-filtered
+semi-global search), not the build's. One line per failure, naming the check and the first offender."""
+import hashlib
+import re
 import sys
 import tomllib
 from pathlib import Path
 
+import duckdb
 import polars as pl
 import pyarrow.parquet as pq
 
 params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
-FLOOR = {"antiref96": 189_503_281, "antiref99": 284_384_885}  # rows: 90% of the first full build's
-HELDOUT = ["eval_singletons", "eval_gte2", "test_singletons", "test_gte2"]
-TRAIN_COLUMNS = {"antiref96": ["sequence_id", "sequence", "member_ids", "member_sequences"],
-                 "antiref99": ["sequence_id", "sequence"]}
+TRAIN_LEVELS = ["antiref90", "antiref92", "antiref94", "antiref96"]
+FLOOR = {level: 0 for level in TRAIN_LEVELS}  # rows: 90% of the first full build's
+V1 = {"eval_singletons": "f28027d3b65fc11e1ac790674d5be1885775973c072da9dfd4e4e91899648552",
+      "eval_gte2": "862f73fe8c1faadcf98c50c5b6c83742dac6e6fc36c1b1331ee4896e6ee28c99",
+      "test_singletons": "cc6381e9e0fedb8c447925c9d369ef57e219237ab61f60055166b27ed8688758",
+      "test_gte2": "9456f11b468f016492fc58f03817de55a8b385879a73ded08ee50a92073aa9d5"}  # oplm-antibody-sequences v1.0.0
+CDRH3 = ["eval_cdrh3", "test_cdrh3"]
+TRAIN_COLUMNS = ["sequence_id", "sequence", "member_ids", "member_sequences"]
 HELDOUT_COLUMNS = ["sequence_id", "sequence", "locus", "cdr_mask_aa"]
+SAMPLE_ROWS, SAMPLE_UNANCHORED = 1000, 200
+NEAR = ("abs(length(a.cdr3) - length(b.cdr3)) <= greatest(length(a.cdr3), length(b.cdr3)) // 5 "
+        "AND levenshtein(a.cdr3, b.cdr3) <= greatest(length(a.cdr3), length(b.cdr3)) // 5")  # 80% CDR3 identity
+published = not params["limit"] and params["heldout"] == 5000
 
 out, problems = Path(sys.argv[1]), []
+con = duckdb.connect()
+
+
+def cdr3(sequence: str, mask: str) -> str:
+    return "".join(a for a, d in zip(sequence, mask) if d == "3")
+
+
+def anchored(sequence: str) -> set[str]:
+    window = sequence[len(sequence) // 2:]
+    return {window[c.end():w.start()] for c in re.finditer("C", window) for w in re.finditer("(?=[WF]G.G)", window)
+            if 3 <= w.start() - c.end() <= 40}
+
+
+def sellers(query: str, window: str) -> int:
+    prev = [0] * (len(window) + 1)
+    for i, x in enumerate(query, 1):
+        cur = [i]
+        for j, y in enumerate(window, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x != y)))
+        prev = cur
+    return min(prev)
+
+
+def grams(s: str) -> set[str]:
+    return {s[i:i + 3] for i in range(len(s) - 2)}
+
+
 held = {}
-for name in HELDOUT:
+for name in [*V1, *CDRH3]:
     path = out / f"{name}.parquet"
     if not path.is_file():
         problems.append(f"files: {name}.parquet is missing")
@@ -27,56 +66,92 @@ for name in HELDOUT:
     if df.columns != HELDOUT_COLUMNS:
         problems.append(f"columns: {name}.parquet has {df.columns}, not {HELDOUT_COLUMNS}")
         continue
-    if df.height != params["heldout"]:
-        problems.append(f"rows: {name}.parquet has {df.height}, not {params['heldout']}")
+    want = params["cdrh3_heldout"] if name in CDRH3 else params["heldout"]
+    if df.height != want:
+        problems.append(f"rows: {name}.parquet has {df.height}, not {want}")
     bad = {
-        "locus": ~pl.col("locus").is_in(["IGH", "IGK", "IGL"]),
+        "locus": ~pl.col("locus").is_in(["IGH"] if name in CDRH3 else ["IGH", "IGK", "IGL"]),
         "cdr_mask_aa length": pl.col("cdr_mask_aa").str.len_chars() != pl.col("sequence").str.len_chars(),
         "cdr_mask_aa digits": ~pl.col("cdr_mask_aa").str.contains(r"^[0-3]+$"),
         "cdr_mask_aa one CDR3": ~pl.col("cdr_mask_aa").str.contains(r"^[0-2]*3+[0-2]*$"),
     }
+    if name in CDRH3:
+        bad["CDR3 under 5"] = pl.col("cdr_mask_aa").str.count_matches("3") < 5
     for check, expr in bad.items():
         hit = df.filter(expr.fill_null(True))
         if hit.height:
             problems.append(f"{check}: {hit.height} rows in {name}.parquet, first {hit['sequence_id'][0]}")
-    held[name] = set(df["sequence_id"])
+    if name in V1 and published and hashlib.sha256(path.read_bytes()).hexdigest() != V1[name]:
+        problems.append(f"sha256: {name}.parquet differs from oplm-antibody-sequences v1.0.0's")
+    held[name] = df
     print(f"{name}.parquet {df.height} rows")
+if not published:
+    print("skip sha256 (a dry run's parameters)")
 
-edges = {}
-for folder, columns in TRAIN_COLUMNS.items():
-    shards = sorted((out / folder / "train").glob("*.parquet"))
+queries = [cdr3(s, m) for name in CDRH3 if name in held for s, m in held[name].select("sequence", "cdr_mask_aa").iter_rows()]
+con.execute("CREATE TABLE q AS SELECT unnest(range(?)) AS qid, unnest(?::VARCHAR[]) AS cdr3", [len(queries), queries])
+pair = con.sql(f"SELECT a.qid, b.qid FROM q a JOIN q b ON a.qid < b.qid AND {NEAR} LIMIT 1").fetchall()
+if pair:
+    problems.append(f"cdrh3 separation: held-out CDR3s {queries[pair[0][0]]} and {queries[pair[0][1]]} are 80% identical")
+
+held_ids = {name: set(df["sequence_id"]) for name, df in held.items()}
+members: dict[str, set[str]] = {}
+sample: list[str] = []
+for level in TRAIN_LEVELS:
+    shards = sorted((out / level / "train").glob("*.parquet"))
     if not shards:
-        problems.append(f"files: {folder}/train has no shards")
+        problems.append(f"files: {level}/train has no shards")
         continue
-    names = [p.name for p in shards]
-    if names != [f"shard-{i:05d}.parquet" for i in range(len(shards))]:
-        problems.append(f"files: {folder}/train's shards are not shard-00000.parquet onward without gaps")
+    if [p.name for p in shards] != [f"shard-{i:05d}.parquet" for i in range(len(shards))]:
+        problems.append(f"files: {level}/train's shards are not shard-00000.parquet onward without gaps")
     counts = [pq.ParquetFile(p).metadata.num_rows for p in shards]
     if any(n != params["shard_rows"] for n in counts[:-1]):
-        problems.append(f"rows: a {folder}/train shard before the last is not {params['shard_rows']} rows")
-    if sum(counts) < FLOOR[folder]:
-        problems.append(f"rows: {folder}/train has {sum(counts)}, under its floor {FLOOR[folder]}")
-    for p in {shards[0], shards[-1]}:
+        problems.append(f"rows: a {level}/train shard before the last is not {params['shard_rows']} rows")
+    if sum(counts) < FLOOR[level]:
+        problems.append(f"rows: {level}/train has {sum(counts)}, under its floor {FLOOR[level]}")
+    for p in sorted({shards[0], shards[-1]}):
         df = pl.read_parquet(p)
-        if df.columns != columns:
-            problems.append(f"columns: {folder}/train/{p.name} has {df.columns}, not {columns}")
+        if df.columns != TRAIN_COLUMNS:
+            problems.append(f"columns: {level}/train/{p.name} has {df.columns}, not {TRAIN_COLUMNS}")
             continue
-        edges[f"{folder}/train/{p.name}"] = set(df["sequence_id"])
-        if folder == "antiref96":
-            bad = df.filter(
-                (pl.col("member_ids").list.first() != pl.col("sequence_id"))
-                | (pl.col("member_sequences").list.first() != pl.col("sequence"))
-                | (pl.col("member_ids").list.len() != pl.col("member_sequences").list.len())
-            )
-            if bad.height:
-                problems.append(f"members: {bad.height} rows in {folder}/train/{p.name}, first {bad['sequence_id'][0]}")
-    print(f"{folder}/train {len(shards)} shards {sum(counts)} rows")
+        bad = df.filter((pl.col("member_ids").list.first() != pl.col("sequence_id"))
+                        | (pl.col("member_sequences").list.first() != pl.col("sequence"))
+                        | (pl.col("member_ids").list.len() != pl.col("member_sequences").list.len())
+                        | (pl.col("member_ids").list.len() == 0))
+        if bad.height:
+            problems.append(f"members: {bad.height} rows in {level}/train/{p.name}, first {bad['sequence_id'][0]}")
+        members[f"{level}/train/{p.name}"] = set(df["member_ids"].explode())
+        if p == shards[0]:
+            sample += df.head(SAMPLE_ROWS)["member_sequences"].explode().to_list()
+    print(f"{level}/train {len(shards)} shards {sum(counts)} rows")
 
-seen = {}
-for where, ids in [*held.items(), *edges.items()]:
-    for name, other in seen.items():
-        if not (where in edges and name in edges) and ids & other:
-            problems.append(f"sequence_id: {next(iter(ids & other))} is in {name} and {where}")
-    seen[where] = ids
+names = list(held_ids)
+for i, a in enumerate(names):
+    for b in names[i + 1:]:
+        if held_ids[a] & held_ids[b]:
+            problems.append(f"sequence_id: {next(iter(held_ids[a] & held_ids[b]))} is in {a} and {b}")
+    for where, other in members.items():
+        if held_ids[a] & other:
+            problems.append(f"sequence_id: {next(iter(held_ids[a] & other))} is in {a} and {where}")
+
+# The screen, on sampled members: anchored candidates against every held-out CDR3 in DuckDB; a member with no anchored
+# candidate by a semi-global search within floor(0.25 x query length), after a q-gram filter (a substring within k
+# edits of q keeps all but at most 3k of q's distinct 3-grams: an edit touches three).
+cands = [(i, c) for i, s in enumerate(sample) for c in anchored(s)]
+con.execute("CREATE TABLE a AS SELECT unnest(?::INTEGER[]) AS i, unnest(?::VARCHAR[]) AS cdr3",
+            [[i for i, _ in cands], [c for _, c in cands]])
+leak = con.sql(f"SELECT a.i, b.qid FROM a JOIN q b ON {NEAR} LIMIT 1").fetchall()
+if leak:
+    problems.append(f"screen: a sampled member carries held-out CDR3 {queries[leak[0][1]]}: {sample[leak[0][0]]}")
+loose = [s for s in sample if not anchored(s)][:SAMPLE_UNANCHORED]
+qgrams = [(q, grams(q), len(q) // 4) for q in queries]
+for s in loose:
+    window = s[len(s) // 2:]
+    wg = grams(window)
+    hit = next((q for q, g, k in qgrams if len(g & wg) >= len(g) - 3 * k and sellers(q, window) <= k), None)
+    if hit:
+        problems.append(f"screen: unanchored sampled member carries held-out CDR3 {hit}: {s}")
+        break
+print(f"screen sample: {len(sample)} members, {len(cands)} anchored candidates, {len(loose)} unanchored checked")
 print("\n".join(problems) or "ok")
 sys.exit(1 if problems else 0)
