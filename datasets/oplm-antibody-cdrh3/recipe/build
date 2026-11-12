@@ -1,0 +1,335 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/build <out>: OPLM's antibody sequences from AntiRef v2022.12.14 (Zenodo 7474336 and 7474658). Held-out
+AntiRef90 clusters, singletons and gte2, are numbered with ANARCII and written as eval and test with `locus` and an
+abstar-format `cdr_mask_aa`; every other cluster goes to two train sets, AntiRef96 clusters with their AntiRef99
+members and AntiRef99 representatives, sharded as OPLM's uniref70 and deepclust70 are.
+
+Stages under <out>/.work/, each skipped when a rerun finds it finished. Prints `held out failed numbering` lines,
+then `rows` and `locus` lines last.
+"""
+import gzip
+import hashlib
+import itertools
+import os
+import re
+import shutil
+import sys
+import tomllib
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import duckdb
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+from anarcii import Anarcii
+
+# file: (Zenodo record, bytes, MD5)
+SOURCE = {"antiref_cluster-manifest.csv.gz": (7474336, 14054641207, "18fcf6376702a2d23e2acdc32f1fd40a"),
+          "antiref100.fasta.gz": (7474658, 18496427276, "4a82d4be0c493377668fac9730aca866")}
+STREAMS = 32
+LEVELS = ["antiref100", "antiref99", "antiref98", "antiref96", "antiref94", "antiref92", "antiref90"]
+REGIONS = [(27, 38, "1"), (56, 65, "2"), (105, 117, "3")]  # IMGT; everything else is framework, 0
+LOCI = {"H": "IGH", "K": "IGK", "L": "IGL"}
+STRATA = {"singletons": "size = 1", "gte2": "size >= 2"}
+# a heavy chain whose IMGT regions are FWR1 25, CDR1 8, FWR2 17, CDR2 8, FWR3 38, CDR3 21 (with insertions), FWR4 11
+KNOWN = ("QVQLVQSGAEVKKPGASVKVSCKASGYTFTSYAMYWVRQAPGQRLEWMGWINARNGNTKYSQKFQGRVTITRDTSASTAYMELSSLRSEDTAVYYCARSPYSSSWPGYYYYYYGMDVWGQGTTVTVSS",
+         "00000000000000000000000001111111100000000000000000222222220000000000000000000000000000000000000033333333333333333333300000000000")
+
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+out = Path(sys.argv[1]).resolve()
+work = out / ".work"
+cpus = len(os.sched_getaffinity(0))  # the job's CPUs, not the node's
+seed = params["seed"]
+
+
+def order(column: str) -> str:
+    """The seeded order: md5 of '<seed>:<id>', stable across tools and versions, sortable out of core."""
+    return f"md5('{seed}:' || {column})"
+
+
+def connect() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect()
+    con.execute(f"SET threads = {cpus}; SET temp_directory = '{work / 'duckdb'}'")
+    return con
+
+
+def levenshtein(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        cur = [i]
+        for j, y in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x != y)))
+        prev = cur
+    return prev[-1]
+
+
+def near(a: str, b: str) -> bool:
+    """80% CDR3 identity: an edit distance of at most floor(0.2 x the longer length)."""
+    return levenshtein(a, b) <= max(len(a), len(b)) // 5
+
+
+def anchored(sequence: str) -> list[str]:
+    """Every CDR3 the C-terminal half could hold: 3-40 residues right after a C and right before [WF]G.G."""
+    window = sequence[len(sequence) // 2:]
+    starts = [m.end() for m in re.finditer("C", window)]
+    ends = [m.start() for m in re.finditer("(?=[WF]G.G)", window)]
+    return list(dict.fromkeys(window[s:e] for s in starts for e in ends if 3 <= e - s <= 40))
+
+
+def semiglobal_within(query: str, window: str, k: int) -> bool:
+    """Sellers: whether some substring of `window` is within k edits of `query`."""
+    prev = [0] * (len(window) + 1)
+    for i, x in enumerate(query, 1):
+        cur = [i]
+        for j, y in enumerate(window, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x != y)))
+        prev = cur
+    return min(prev) <= k
+
+
+class PieceIndex:
+    """Pigeonhole index over held-out CDR3s. A query of length L is cut into L // 4 + 1 pieces; anything near it
+    (at most floor(0.2 x max length) <= L // 4 edits) holds one piece exactly."""
+
+    def __init__(self) -> None:
+        self.queries: dict[int, str] = {}
+        self.pieces: dict[str, set[int]] = {}
+        self.lengths: set[int] = set()
+
+    def add(self, query: str, qid: int) -> None:
+        self.queries[qid] = query
+        p = len(query) // 4 + 1
+        bounds = [round(i * len(query) / p) for i in range(p + 1)]
+        for lo, hi in itertools.pairwise(bounds):
+            self.pieces.setdefault(query[lo:hi], set()).add(qid)
+            self.lengths.add(hi - lo)
+
+    def candidates(self, text: str) -> set[int]:
+        hits: set[int] = set()
+        for n in self.lengths:
+            for i in range(len(text) - n + 1):
+                hits |= self.pieces.get(text[i:i + n], set())
+        return hits
+
+    def match(self, cand: str) -> int | None:
+        return min((q for q in self.candidates(cand) if near(self.queries[q], cand)), default=None)
+
+
+def selfcheck() -> None:
+    """Known answers for the CDR3 matching, run before every build. KNOWN's CDR3 is 21 residues, so 4 edits are near."""
+    q = "ARSPYSSSWPGYYYYYYGMDV"
+    assert levenshtein("kitten", "sitting") == 3
+    assert near(q, q) and near(q, q[:-1] + "I")
+    assert near(q, "GRSPYSASWPGYYAYYYGMDI")  # 4 substitutions
+    assert not near(q, "GRSQYSASWQGYYAYYYGMDI")  # 6 substitutions
+    assert not near(q, "GRSPYSASFPGYYAYYYGMDI")  # 5 substitutions: one past the bound
+    assert not near("ARDYYYYYGMDV", "ARGGGSDYYYYYGMDVTT")  # 6 apart, the bound is 3
+    assert near("", "") and anchored("") == [] and anchored("nan") == []
+    assert q in anchored(KNOWN[0])
+    w = KNOWN[0][len(KNOWN[0]) // 2:]
+    assert semiglobal_within(q, w, 5) and not semiglobal_within("WWWWWWWWWW", w, 2)
+    idx = PieceIndex()
+    idx.add(q, 7)
+    assert idx.match(q) == 7 and idx.match("GRSPYSASWPGYYAYYYGMDI") == 7
+    assert idx.match("ARDYYYYYGMDV") is None
+
+
+def fetch_range(url: str, part: Path, lo: int, hi: int) -> None:
+    request = urllib.request.Request(url, headers={"Range": f"bytes={lo}-{hi}"})
+    with urllib.request.urlopen(request) as r, part.open("r+b") as f:
+        if r.status != 206:
+            raise RuntimeError(f"{url} answered {r.status} to a range request")
+        f.seek(lo)
+        while chunk := r.read(1 << 22):
+            f.write(chunk)
+        if f.tell() != hi + 1:
+            raise RuntimeError(f"{url} bytes {lo}-{hi} ended at {f.tell()}")
+
+
+def download(dest: Path) -> None:
+    """Each file in STREAMS parallel ranges: Zenodo serves about 1 MB/s to one stream, 17 MB/s to 32."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for name, (record, size, md5) in SOURCE.items():
+        path = dest / name
+        if path.is_file() and path.stat().st_size == size:
+            continue
+        url, part = f"https://zenodo.org/api/records/{record}/files/{name}/content", path.with_suffix(".part")
+        with part.open("wb") as f:
+            f.truncate(size)
+        bounds = [(i * size // STREAMS, (i + 1) * size // STREAMS - 1) for i in range(STREAMS)]
+        with ThreadPoolExecutor(STREAMS) as pool:
+            list(pool.map(lambda b: fetch_range(url, part, *b), bounds))
+        digest = hashlib.md5()
+        with part.open("rb") as f:
+            while chunk := f.read(1 << 24):
+                digest.update(chunk)
+        if digest.hexdigest() != md5:
+            part.unlink()
+            sys.exit(f"MD5 {digest.hexdigest()} != {md5} for {name}")
+        part.rename(path)
+
+
+def stage(work: Path, limit: int) -> None:
+    """manifest.parquet (the seven levels) and sequences.parquet (sequence_id, sequence). With `limit`, only the first
+    `limit` AntiRef90 clusters in the seeded order, whole, so every representative's own row comes along."""
+    manifest, sequences = work / "manifest.parquet", work / "sequences.parquet"
+    con = connect()
+    if not manifest.is_file():
+        columns = ", ".join(f"'{c}': 'VARCHAR'" for c in LEVELS)
+        csv = f"read_csv('{work / 'antiref_cluster-manifest.csv.gz'}', header = true, columns = {{{columns}}})"
+        select = (f"WITH m AS (SELECT * FROM {csv}), keep AS (SELECT DISTINCT antiref90 FROM m ORDER BY {order('antiref90')} "
+                  f"LIMIT {limit}) SELECT m.* FROM m SEMI JOIN keep USING (antiref90)") if limit else f"SELECT * FROM {csv}"
+        con.execute(f"COPY ({select}) TO '{manifest}.part' (FORMAT parquet, COMPRESSION zstd)")
+        os.rename(f"{manifest}.part", manifest)
+    if not sequences.is_file():
+        wanted = set(con.sql(f"SELECT antiref100 FROM '{manifest}'").fetchnumpy()["antiref100"]) if limit else None
+        schema = pa.schema([("sequence_id", pa.string()), ("sequence", pa.string())])
+        with gzip.open(work / "antiref100.fasta.gz", "rt") as f, pq.ParquetWriter(f"{sequences}.part", schema, compression="zstd") as w:
+            ids, seqs = [], []
+            for line in f:
+                if line.startswith(">"):
+                    sid = line[1:].strip()
+                    continue
+                if wanted is None or sid in wanted:
+                    ids.append(sid)
+                    seqs.append(line.strip())
+                if len(ids) == 1_000_000:
+                    w.write_table(pa.table([ids, seqs], schema=schema))
+                    ids, seqs = [], []
+            w.write_table(pa.table([ids, seqs], schema=schema))
+        os.rename(f"{sequences}.part", sequences)
+    lacking = con.sql(f"SELECT count(*) FROM '{manifest}' ANTI JOIN '{sequences}' s ON antiref100 = s.sequence_id").fetchall()[0][0]
+    if lacking:
+        sys.exit(f"{lacking} manifest ids lack a sequence")
+    if not limit:
+        unlisted = con.sql(f"SELECT count(*) FROM '{sequences}' ANTI JOIN '{manifest}' m ON sequence_id = m.antiref100").fetchall()[0][0]
+        if unlisted:
+            sys.exit(f"{unlisted} sequences lack a manifest row")
+
+
+def cdr_mask(numbering: list, sequence: str) -> str | None:
+    """abstar's cdr_mask_aa from ANARCII's IMGT numbering: one digit per residue, or None when the numbered residues
+    are not exactly `sequence` or there is no CDR3."""
+    residues = [(pos, aa) for (pos, _ins), aa in numbering if aa != "-"]
+    if "".join(aa for _, aa in residues) != sequence:
+        return None
+    mask = "".join(next((c for lo, hi, c in REGIONS if lo <= pos <= hi), "0") for pos, _ in residues)
+    return mask if "3" in mask else None
+
+
+def heldout_sets(work: Path, n: int) -> dict[str, list[dict]]:
+    """The first n numbered representatives of each stratum, in the seeded order, are eval; the next n test."""
+    anarcii = Anarcii(seq_type="antibody", mode="accuracy", cpu=True, ncpu=cpus)
+    known = anarcii.number({"known": KNOWN[0]})["known"]
+    if known["chain_type"] != "H" or cdr_mask(known["numbering"], KNOWN[0]) != KNOWN[1]:
+        sys.exit(f"ANARCII's known answer moved: {known['chain_type']} {cdr_mask(known['numbering'], KNOWN[0])}")
+    con, sets = connect(), {}
+    for stratum, where in STRATA.items():
+        rows = con.cursor().execute(
+            f"WITH c AS (SELECT antiref90, count(*) AS size FROM '{work / 'manifest.parquet'}' GROUP BY antiref90) "
+            f"SELECT c.antiref90, s.sequence FROM c JOIN '{work / 'sequences.parquet'}' s ON s.sequence_id = c.antiref90 "
+            f"WHERE {where} ORDER BY {order('c.antiref90')}")
+        kept, failed = [], 0
+        while len(kept) < 2 * n and (pool := rows.fetchmany(int(2.4 * n))):
+            numbered = anarcii.number(dict(pool))
+            for sid, sequence in pool:
+                if len(kept) == 2 * n:
+                    break
+                result = numbered.get(sid, {"chain_type": "F"})
+                mask = cdr_mask(result["numbering"], sequence) if result["chain_type"] in LOCI else None
+                if mask is None:
+                    failed += 1
+                else:
+                    kept.append({"sequence_id": sid, "sequence": sequence, "locus": LOCI[result["chain_type"]], "cdr_mask_aa": mask})
+        if len(kept) < 2 * n:
+            sys.exit(f"stratum {stratum}: {len(kept)} of {2 * n} after {len(kept) + failed} candidates")
+        print(f"held out failed numbering {stratum}: {failed}")
+        sets[f"eval_{stratum}"], sets[f"test_{stratum}"] = kept[:n], kept[n:]
+    return sets
+
+
+def write_shards(batches: pa.RecordBatchReader, folder: Path, shard_rows: int) -> None:
+    tmp = folder.with_suffix(".part")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    def write(table: pa.Table, i: int) -> None:
+        pq.write_table(table, tmp / f"shard-{i:05d}.parquet", row_group_size=10_000, compression="zstd")
+
+    # DuckDB's reader hands back its own batch sizes (79,872 rows from a sort), so shards are cut here
+    held, i = [], 0
+    for batch in batches:
+        held.append(batch)
+        while sum(b.num_rows for b in held) >= shard_rows:
+            table = pa.Table.from_batches(held)
+            write(table.slice(0, shard_rows), i)
+            held, i = table.slice(shard_rows).to_batches(), i + 1
+    if sum(b.num_rows for b in held):
+        write(pa.Table.from_batches(held), i)
+    tmp.rename(folder)
+
+
+def clusters(reader: pa.RecordBatchReader):
+    """One row per AntiRef96 cluster from rows (antiref96, antiref99, sequence) sorted so that each cluster's rows are
+    together, its representative first. A batch's last cluster may go on in the next batch, so it waits for it."""
+    held = reader.schema.empty_table()
+    for batch in itertools.chain(reader, [None]):
+        t = held if batch is None else pa.concat_tables([held, pa.Table.from_batches([batch])]).combine_chunks()
+        if not t.num_rows:
+            continue
+        c = t["antiref96"].combine_chunks()
+        starts = [0, *pc.add(pc.indices_nonzero(pc.not_equal(c[1:], c[:-1])), 1).to_pylist()]
+        end = t.num_rows if batch is None else starts.pop()
+        held, t = t.slice(end), t.slice(0, end)
+        if not starts:
+            continue
+        ids, seqs, offsets = t["antiref99"].combine_chunks(), t["sequence"].combine_chunks(), pa.array([*starts, end], pa.int32())
+        stray = pc.not_equal(c.take(starts), ids.take(starts))
+        if pc.any(stray).as_py():
+            sys.exit(f"AntiRef96 representative {c.take(starts).filter(stray)[0]} is not among its own AntiRef99 members")
+        yield pa.record_batch({"sequence_id": c.take(starts), "sequence": seqs.take(starts),
+                               "member_ids": pa.ListArray.from_arrays(offsets, ids),
+                               "member_sequences": pa.ListArray.from_arrays(offsets, seqs)})
+
+
+def train(work: Path, shard_rows: int) -> None:
+    """Every manifest row outside the held-out AntiRef90 clusters, as AntiRef96 clusters with their AntiRef99 members
+    (representative first) and as AntiRef99 representatives, each in the seeded order."""
+    con = connect()
+    con.execute(f"CREATE VIEW kept AS SELECT * FROM '{work / 'manifest.parquet'}' ANTI JOIN '{work / 'heldout.parquet'}' h "
+                f"USING (antiref90)")
+    con.execute(f"CREATE VIEW seqs AS SELECT * FROM '{work / 'sequences.parquet'}'")
+    if not (out / "antiref99" / "train").is_dir():
+        write_shards(con.sql(f"SELECT d.antiref99 AS sequence_id, s.sequence FROM (SELECT DISTINCT antiref99 FROM kept) d "
+                             f"JOIN seqs s ON s.sequence_id = d.antiref99 ORDER BY {order('d.antiref99')}").to_arrow_reader(),
+                     out / "antiref99" / "train", shard_rows)
+    if not (out / "antiref96" / "train").is_dir():
+        # one sort and a streaming group: an ordered list() over 300M sequences spilled 90 GB and stalled
+        rows = con.sql(f"SELECT m.antiref96, m.antiref99, s.sequence FROM (SELECT DISTINCT antiref96, antiref99 FROM kept) m "
+                       f"JOIN seqs s ON s.sequence_id = m.antiref99 "
+                       f"ORDER BY {order('m.antiref96')}, m.antiref96, m.antiref99 = m.antiref96 DESC, {order('m.antiref99')}")
+        write_shards(clusters(rows.to_arrow_reader()), out / "antiref96" / "train", shard_rows)
+
+
+selfcheck()
+if sys.argv[1:] == ["--selfcheck"]:
+    sys.exit(0)
+download(work)
+stage(work, params["limit"])
+if not (work / "heldout.parquet").is_file():
+    for name, rows in heldout_sets(work, params["heldout"]).items():
+        pq.write_table(pa.Table.from_pylist(rows), out / f"{name}.parquet", compression="zstd")
+    ids = [r["sequence_id"] for name in ("eval", "test") for s in STRATA for r in pq.read_table(out / f"{name}_{s}.parquet").to_pylist()]
+    pq.write_table(pa.table({"antiref90": ids}), work / "heldout.parquet")
+train(work, params["shard_rows"])
+
+con = connect()
+for folder in ("antiref96", "antiref99"):
+    print(f"rows {folder}/train: {con.sql(f"SELECT count(*) FROM '{out / folder / 'train'}/*.parquet'").fetchall()[0][0]}")
+for name in ("eval", "test"):
+    for s in STRATA:
+        path = out / f"{name}_{s}.parquet"
+        print(f"rows {path.name}: {pq.ParquetFile(path).metadata.num_rows}")
+        for locus, count in con.sql(f"SELECT locus, count(*) FROM '{path}' GROUP BY locus ORDER BY locus").fetchall():
+            print(f"locus {path.name} {locus}: {count}")
