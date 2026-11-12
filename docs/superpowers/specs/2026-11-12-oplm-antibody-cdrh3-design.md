@@ -79,12 +79,12 @@ Remove from train:
 
 **What "near match" means here.** The match is CDR3 against CDR3: the PI's 80% is CDR3 identity, not containment. The guarantee must still not depend on locating each train sequence's CDR3 exactly. ANARCII on about 300M sequences is too slow for CPU, and a regex (`C(...)[WF]G.G`) agreed with ANARCII's CDR3 on only 93% of eval chains. So the screen tries every plausible boundary pair.
 
-- **Window.** For each train sequence, take the window from 10 residues before the conserved Cys104 to the end of the sequence.
+- **Window.** For each train sequence, the window is its C-terminal half, `sequence[len(sequence) // 2:]`. CDR3 starts near residue 105 of about 120, so the half always holds it, and the screen never needs to locate Cys104. Planning chose this over a window that starts 10 residues before Cys104: it is a superset of that window, so it can only remove more **(call)**.
 - **Anchored candidates (call).** A candidate CDR3 is any substring of the window that starts right after a `C` and ends right before a `[WF]G.G` motif, 3 to 40 residues long.
   - Each candidate is compared end to end with each held-out CDR3 by §5.2's identity.
   - A train sequence goes when any of its candidates is 80% or more identical to any held-out CDR3.
   - This tries every boundary pair, so a misplaced boundary can't hide a match. It also can't match a held-out CDR3 against a fragment of a longer train CDR3, which keeps shared germline D or J stretches (`…YYYYYGMDV`) from removing unrelated antibodies.
-- **Unanchored sequences.** A sequence with no anchored candidate (about 6% of v1 train sequences by the regex) gets the conservative fallback. It goes when any window substring of 3 to 40 residues meets the identity bound **(call)**.
+- **Unanchored sequences.** A sequence with no anchored candidate (about 6% of v1 train sequences by the regex) gets the conservative fallback. It goes when any window substring meets the identity bound. The check runs as a semi-global edit distance of at most `floor(0.25 × len(query))`. That is a superset of the 80% bound for any substring length, since the bound allows at most `floor(0.2 × max length)` edits and a substring more than 25% longer than the query is out of reach **(call)**.
 - **Light chains.** The screen covers every train sequence, light chains included. A light chain rarely matches a heavy CDR3, and skipping chain typing keeps the screen simple **(call)**.
 - **Speed.** How to run 10,000 queries against about 300M sequences fast is the builder's call. For example, by pigeonhole: a match within edit distance `k` shares an exact `⌊L/(k+1)⌋`-mer with the query, so an exact k-mer index narrows the candidates before alignment.
 
