@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -I
 """recipe/test <out>: exit 0 iff <out> holds a version of oplm-antibody-cdrh3. Reads parquet footers, the six held-out
-files, and the first and last shard of each train folder; checks the CDR3 holdout's 80% separation and, on sampled
+files, and the first and last shard of each train folder; checks the CDR3 holdout's 85% separation and, on sampled
 train members, that the screen holds, with its own matching code (DuckDB's levenshtein and a q-gram-filtered
 semi-global search), not the build's. One line per failure, naming the check and the first offender."""
 import hashlib
@@ -24,8 +24,8 @@ CDRH3 = ["eval_cdrh3", "test_cdrh3"]
 TRAIN_COLUMNS = ["sequence_id", "sequence", "member_ids", "member_sequences"]
 HELDOUT_COLUMNS = ["sequence_id", "sequence", "locus", "cdr_mask_aa"]
 SAMPLE_ROWS, SAMPLE_UNANCHORED = 1000, 200
-NEAR = ("abs(length(a.cdr3) - length(b.cdr3)) <= greatest(length(a.cdr3), length(b.cdr3)) // 5 "
-        "AND levenshtein(a.cdr3, b.cdr3) <= greatest(length(a.cdr3), length(b.cdr3)) // 5")  # 80% CDR3 identity
+NEAR = ("abs(length(a.cdr3) - length(b.cdr3)) <= greatest(length(a.cdr3), length(b.cdr3)) * 3 // 20 "
+        "AND levenshtein(a.cdr3, b.cdr3) <= greatest(length(a.cdr3), length(b.cdr3)) * 3 // 20")  # 85% CDR3 identity
 published = not params["limit"] and params["heldout"] == 5000
 
 out, problems = Path(sys.argv[1]), []
@@ -92,7 +92,7 @@ queries = [cdr3(s, m) for name in CDRH3 if name in held for s, m in held[name].s
 con.execute("CREATE TABLE q AS SELECT unnest(range(?)) AS qid, unnest(?::VARCHAR[]) AS cdr3", [len(queries), queries])
 pair = con.sql(f"SELECT a.qid, b.qid FROM q a JOIN q b ON a.qid < b.qid AND {NEAR} LIMIT 1").fetchall()
 if pair:
-    problems.append(f"cdrh3 separation: held-out CDR3s {queries[pair[0][0]]} and {queries[pair[0][1]]} are 80% identical")
+    problems.append(f"cdrh3 separation: held-out CDR3s {queries[pair[0][0]]} and {queries[pair[0][1]]} are 85% identical")
 
 held_ids = {name: set(df["sequence_id"]) for name, df in held.items()}
 members: dict[str, set[str]] = {}
@@ -135,7 +135,7 @@ for i, a in enumerate(names):
             problems.append(f"sequence_id: {next(iter(held_ids[a] & other))} is in {a} and {where}")
 
 # The screen, on sampled members: anchored candidates against every held-out CDR3 in DuckDB; a member with no anchored
-# candidate by a semi-global search within floor(0.25 x query length), after a q-gram filter (a substring within k
+# candidate by a semi-global search within 3 x query length // 17, after a q-gram filter (a substring within k
 # edits of q keeps all but at most 3k of q's distinct 3-grams: an edit touches three).
 cands = [(i, c) for i, s in enumerate(sample) for c in anchored(s)]
 con.execute("CREATE TABLE a AS SELECT unnest(?::INTEGER[]) AS i, unnest(?::VARCHAR[]) AS cdr3",
@@ -144,7 +144,7 @@ leak = con.sql(f"SELECT a.i, b.qid FROM a JOIN q b ON {NEAR} LIMIT 1").fetchall(
 if leak:
     problems.append(f"screen: a sampled member carries held-out CDR3 {queries[leak[0][1]]}: {sample[leak[0][0]]}")
 loose = [s for s in sample if not anchored(s)][:SAMPLE_UNANCHORED]
-qgrams = [(q, grams(q), len(q) // 4) for q in queries]
+qgrams = [(q, grams(q), len(q) * 3 // 17) for q in queries]
 for s in loose:
     window = s[len(s) // 2:]
     wg = grams(window)

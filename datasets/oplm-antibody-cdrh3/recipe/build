@@ -1,8 +1,8 @@
 #!/usr/bin/env -S python3 -I
 """recipe/build <out>: OPLM's antibody sequences from AntiRef v2022.12.14 (Zenodo 7474336 and 7474658), with a
 heavy-chain CDR3-identity holdout. oplm-antibody-sequences v1.0.0's held-out AntiRef90 clusters come out unchanged. Then
-10,000 more heavy-chain AntiRef90 representatives, their CDR3s mutually under 80% identical, are eval_cdrh3 and
-test_cdrh3, and every AntiRef99 sequence carrying one of those CDR3s at 80% identity or more is screened out of train.
+10,000 more heavy-chain AntiRef90 representatives, their CDR3s mutually under 85% identical, are eval_cdrh3 and
+test_cdrh3, and every AntiRef99 sequence carrying one of those CDR3s at 85% identity or more is screened out of train.
 What remains is written as AntiRef90, 92, 94 and 96 clusters with their AntiRef99 members, sharded as OPLM's uniref70.
 
 Stages under <out>/.work/, each skipped when a rerun finds it finished. Runs a self-check first (`--selfcheck` alone
@@ -69,9 +69,28 @@ def levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
+def within(a: str, b: str, k: int) -> bool:
+    """levenshtein(a, b) <= k, filling only the band of width 2k + 1 around the diagonal and stopping once a row
+    exceeds k: the screen's hot path."""
+    if abs(len(a) - len(b)) > k:
+        return False
+    big = k + 1
+    prev = [j if j <= k else big for j in range(len(b) + 1)]
+    for i, x in enumerate(a, 1):
+        lo, hi = max(1, i - k), min(len(b), i + k)
+        cur = [big] * (len(b) + 1)
+        cur[0] = i if i <= k else big
+        for j in range(lo, hi + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x != b[j - 1]))
+        if min(cur[lo - 1:hi + 1]) > k:
+            return False
+        prev = cur
+    return prev[-1] <= k
+
+
 def near(a: str, b: str) -> bool:
-    """80% CDR3 identity: an edit distance of at most floor(0.2 x the longer length)."""
-    return levenshtein(a, b) <= max(len(a), len(b)) // 5
+    """85% CDR3 identity: an edit distance of at most floor(0.15 x the longer length)."""
+    return within(a, b, max(len(a), len(b)) * 3 // 20)
 
 
 def anchored(sequence: str) -> list[str]:
@@ -94,17 +113,20 @@ def semiglobal_within(query: str, window: str, k: int) -> bool:
 
 
 class PieceIndex:
-    """Pigeonhole index over held-out CDR3s. A query of length L is cut into L // 4 + 1 pieces; anything near it
-    (at most floor(0.2 x max length) <= L // 4 edits) holds one piece exactly."""
+    """Pigeonhole index over held-out CDR3s. A query of length L is cut into 3L // 17 + 1 pieces; anything near it
+    holds one piece exactly, since near allows floor(0.15 x max length) edits and a near string is at most 20L/17 long,
+    so at most 3L // 17 edits."""
 
     def __init__(self) -> None:
         self.queries: dict[int, str] = {}
         self.pieces: dict[str, set[int]] = {}
         self.lengths: set[int] = set()
+        self.memo: dict[str, int | None] = {}  # CDR3s repeat (light chains most), so each is matched once per worker
 
     def add(self, query: str, qid: int) -> None:
+        self.memo.clear()
         self.queries[qid] = query
-        p = len(query) // 4 + 1
+        p = len(query) * 3 // 17 + 1
         bounds = [round(i * len(query) / p) for i in range(p + 1)]
         for lo, hi in itertools.pairwise(bounds):
             self.pieces.setdefault(query[lo:hi], set()).add(qid)
@@ -118,28 +140,36 @@ class PieceIndex:
         return hits
 
     def match(self, cand: str) -> int | None:
-        return min((q for q in self.candidates(cand) if near(self.queries[q], cand)), default=None)
+        if cand not in self.memo:
+            if len(self.memo) > 5_000_000:  # ponytail: wholesale reset bounds memory; an LRU if hit rates suffer
+                self.memo.clear()
+            self.memo[cand] = min((q for q in self.candidates(cand) if near(self.queries[q], cand)), default=None)
+        return self.memo[cand]
 
 
 def screened_by(idx: PieceIndex, sequence: str) -> int | None:
-    """The held-out CDR3 (qid) a train sequence carries at 80% identity, or None. Anchored candidates are compared
-    whole; a sequence with none falls back to a semi-global search of its window within floor(0.25 x query length)."""
+    """The held-out CDR3 (qid) a train sequence carries at 85% identity, or None. Anchored candidates are compared
+    whole; a sequence with none falls back to a semi-global search of its window within 3 x query length // 17."""
     cands = anchored(sequence)
     if cands:
         return min((q for c in cands if (q := idx.match(c)) is not None), default=None)
     window = sequence[len(sequence) // 2:]
     return next((q for q in sorted(idx.candidates(window))
-                 if semiglobal_within(idx.queries[q], window, len(idx.queries[q]) // 4)), None)
+                 if semiglobal_within(idx.queries[q], window, len(idx.queries[q]) * 3 // 17)), None)
 
 
 def selfcheck() -> None:
-    """Known answers for the CDR3 matching, run before every build. KNOWN's CDR3 is 21 residues, so 4 edits are near."""
+    """Known answers for the CDR3 matching, run before every build. KNOWN's CDR3 is 21 residues, so 3 edits are near."""
     q = "ARSPYSSSWPGYYYYYYGMDV"
     assert levenshtein("kitten", "sitting") == 3
+    for x, y in [("kitten", "sitting"), ("", "abc"), ("abc", ""), (q, q[3:]), (q, "GRSPYSASWPGYYAYYYGMDI"),
+                 ("ARDYYYYYGMDV", "ARGGGSDYYYYYGMDVTT"), ("ACDEFG", "GFEDCA"), ("AAAA", "AAAAA")]:
+        for k in range(0, 8):
+            assert within(x, y, k) == (levenshtein(x, y) <= k), (x, y, k)
     assert near(q, q) and near(q, q[:-1] + "I")
-    assert near(q, "GRSPYSASWPGYYAYYYGMDI")  # 4 substitutions
+    assert near(q, "GRSPYSASWPGYYAYYYGMDV")  # 3 substitutions
+    assert not near(q, "GRSPYSASWPGYYAYYYGMDI")  # 4 substitutions: one past the bound
     assert not near(q, "GRSQYSASWQGYYAYYYGMDI")  # 6 substitutions
-    assert not near(q, "GRSPYSASFPGYYAYYYGMDI")  # 5 substitutions: one past the bound
     assert not near("ARDYYYYYGMDV", "ARGGGSDYYYYYGMDVTT")  # 6 apart, the bound is 3
     assert near("", "") and anchored("") == [] and anchored("nan") == []
     assert q in anchored(KNOWN[0])
@@ -147,7 +177,7 @@ def selfcheck() -> None:
     assert semiglobal_within(q, w, 5) and not semiglobal_within("WWWWWWWWWW", w, 2)
     idx = PieceIndex()
     idx.add(q, 7)
-    assert idx.match(q) == 7 and idx.match("GRSPYSASWPGYYAYYYGMDI") == 7
+    assert idx.match(q) == 7 and idx.match("GRSPYSASWPGYYAYYYGMDV") == 7
     assert idx.match("ARDYYYYYGMDV") is None
     loose = KNOWN[0].replace("WGQG", "WAQA")  # no [WF]G.G anchor, so only the fallback can find it
     assert screened_by(idx, KNOWN[0]) == 7
@@ -278,7 +308,7 @@ def heldout_sets(work: Path, n: int) -> dict[str, list[dict]]:
 
 def cdrh3_heldout(work: Path, seed: int, n: int, exclude: set[str]) -> dict[str, list[dict]]:
     """Heavy-chain AntiRef90 representatives outside `exclude`, in the seeded order md5('<seed>:<antiref90>'), kept
-    when numbered with a CDR3 of 5 or more residues that is under 80% identical to every CDR3 kept before it. The
+    when numbered with a CDR3 of 5 or more residues that is under 85% identical to every CDR3 kept before it. The
     first n kept are eval_cdrh3, the next n test_cdrh3."""
     anarcii = Anarcii(seq_type="antibody", mode="accuracy", cpu=True, ncpu=cpus)
     rows = connect().execute(
@@ -320,7 +350,7 @@ def _screen_group(task: tuple[str, int]) -> list[tuple[str, int]]:
 
 
 def screen(work: Path, queries: list[str], cap: float) -> None:
-    """Every AntiRef99 sequence outside the held-out AntiRef90 clusters that carries a held-out heavy CDR3 at 80%
+    """Every AntiRef99 sequence outside the held-out AntiRef90 clusters that carries a held-out heavy CDR3 at 85%
     identity, as .work/screened.parquet (antiref99, qid). Stops the build when it removes more than `cap`."""
     global _screen_idx
     src = work / "screen_in.parquet"
