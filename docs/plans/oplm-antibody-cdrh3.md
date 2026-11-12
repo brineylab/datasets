@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Publish `brineylab/oplm-antibody-cdrh3` v1.0.0. It holds a heavy-chain CDR3-identity holdout at 80%, v1's held-out files unchanged, and four screened train sets (AntiRef90, 92, 94 and 96 clusters with AntiRef99 members). Then run briney/oplm#78's four decay branches on it and report.
+**Goal:** Publish `brineylab/oplm-antibody-cdrh3` v1.0.0. It holds a heavy-chain CDR3-identity holdout at 85%, v1's held-out files unchanged, and four screened train sets (AntiRef90, 92, 94 and 96 clusters with AntiRef99 members). Then run briney/oplm#78's four decay branches on it and report.
 
 **Architecture:** Two repositories, then the cluster.
 1. **brineylab/datasets.** One recipe, `datasets/oplm-antibody-cdrh3/recipe/build`, copied from `oplm-antibody-sequences` and extended. It is a single `python3 -I` program in `datascience@1.2.0`, cooked by hand on bcr as v1 was.
@@ -13,6 +13,8 @@
 **Spec:** `docs/superpowers/specs/2026-11-12-oplm-antibody-cdrh3-design.md` in this worktree (branch `oplm-antibody-cdrh3-design`). Read it first; §5 (steps), §6 (test) and §8 (OPLM) are binding. Also read v1's `datasets/oplm-antibody-sequences/{SKILL.md,recipe/build,recipe/test}`: the new recipe extends them.
 
 ## Global Constraints
+
+**Revised 2026-11-12 (PI):** 85% CDR3 identity at any length, 2,500 + 2,500 held out, tripwire 5%. The spec's §2 says why. Tasks 1–4 were first written at 80%; their code is updated to these values.
 
 **Datasets repository** (its `AGENTS.md`, binding):
 - Bytes on the Hub, never in git. A recipe never pip-installs.
@@ -31,19 +33,19 @@ pulled = "2026-11-09"
 seed = 1           # v1's holdout, unchanged
 heldout = 5000
 cdrh3_seed = 2
-cdrh3_heldout = 5000
-screen_max = 0.03  # build stops if the screen removes more than this share of AntiRef99 train sequences
+cdrh3_heldout = 2500
+screen_max = 0.05  # build stops if the screen removes more than this share of AntiRef99 train sequences
 shard_rows = 1000000
 limit = 0
 ```
 
 **Definitions** (spec §5.2–5.3, exact):
-- `near(a, b)`: `levenshtein(a, b) <= floor(0.2 * max(len(a), len(b)))`.
+- `near(a, b)`: `levenshtein(a, b) <= max(len(a), len(b)) * 3 // 20` (that is, `floor(0.15 * max)`).
 - Window: `sequence[len(sequence) // 2:]`.
 - Anchored candidates: every window substring of 3–40 residues immediately preceded by `C` and immediately followed by a match of `[WF]G.G`.
 - A train sequence is screened out if either:
   - one of its anchored candidates is `near` a held-out CDR3; or
-  - it has no anchored candidate, and the semi-global edit distance of a held-out CDR3 `q` against its window is at most `floor(0.25 * len(q))`.
+  - it has no anchored candidate, and the semi-global edit distance of a held-out CDR3 `q` against its window is at most `len(q) * 3 // 17`.
 - Eval CDR3: residues whose `cdr_mask_aa` digit is `3`.
 
 **v1 files, byte-identical** (sha256 of v1.0.0):
@@ -74,7 +76,7 @@ limit = 0
    - Pinned by Task 1's self-check cases `anchored("")`, `anchored("nan")` and `near("", "")`.
 2. **A cluster whose representative and all members were screened.** The row is dropped, not written with empty lists. OPLM's loader rejects empty member lists. Pinned by Task 3's self-check on `promote()`.
 3. **A coarse-level representative that was not screened but is not its own first member.** This means the nesting broke. The build must stop with the IDs, not silently promote. Pinned by Task 3's self-check.
-4. **Mutually near CDR3s between `eval_cdrh3` and `test_cdrh3`.** The 80% walk spans both files, so no CDR3 in one file is near a CDR3 in the other. Pinned by the test (Task 4), which checks all pairs across both files.
+4. **Mutually near CDR3s between `eval_cdrh3` and `test_cdrh3`.** The 85% walk spans both files, so no CDR3 in one file is near a CDR3 in the other. Pinned by the test (Task 4), which checks all pairs across both files.
 5. **Proxy rounding.** Coarse folders have few shards, so "1/35 of shards" is not 1/35 of the rows. The proxy must hold `round(rows / 35)` rows exactly, from whole shards plus one sliced shard. Pinned by Task 6's check.
 
 ---
@@ -93,12 +95,12 @@ limit = 0
   - `anchored(sequence: str) -> list[str]`: distinct candidates, any order.
   - `semiglobal_within(query: str, window: str, k: int) -> bool`: Sellers' algorithm. True iff some substring of `window` is within `k` edits of `query`.
   - `class PieceIndex`:
-    - `add(query: str, qid: int) -> None`: splits `query` into `floor(0.25 * len(query)) + 1` contiguous pieces of near-equal length and indexes each piece to `qid`;
+    - `add(query: str, qid: int) -> None`: splits `query` into `len(query) * 3 // 17 + 1` contiguous pieces of near-equal length and indexes each piece to `qid`;
     - `candidates(text: str) -> set[int]`: the qids having any piece as an exact substring of `text`;
     - `match(cand: str) -> int | None`: the smallest qid whose query is `near` `cand`, among `candidates(cand)`.
   - `selfcheck() -> None`
   - `recipe/build --selfcheck` runs `selfcheck()` and exits 0.
-- **Pigeonhole guarantee:** if `near(q, c)`, then `c` contains one of `q`'s pieces exactly. `near` allows at most `floor(0.2 * max) <= floor(0.25 * len(q))` edits whenever the lengths are within reach.
+- **Pigeonhole guarantee:** if `near(q, c)`, then `c` contains one of `q`'s pieces exactly. `near` allows at most `floor(0.15 * max)` edits, and a candidate within reach is at most 20/17 of `len(q)`, so at most `len(q) * 3 // 17` edits.
 
 - [ ] **Step 1: Write `selfcheck()` first.** It is assert-based and uses v1's `KNOWN` heavy chain, whose CDR3 is `ARSPYSSSWPGYYYYYYGMDV` (21 residues, so the bound is 4):
   ```python
@@ -127,7 +129,7 @@ limit = 0
 - [ ] **Step 4: Run it again and see it pass.**
   - Same command. Expected: exit 0, no output.
 - [ ] **Step 5: Commit.**
-  - `git commit -m "oplm-antibody-cdrh3 starts from oplm-antibody-sequences and matches CDR3s at 80% identity by a pigeonhole index, with a self-check"`
+  - `git commit -m "oplm-antibody-cdrh3 starts from oplm-antibody-sequences and matches CDR3s at 85% identity by a pigeonhole index, with a self-check"`
 
 ### Task 2: The heavy CDR3 holdout and the screen
 
@@ -138,7 +140,7 @@ limit = 0
 - **Consumes:** Task 1's helpers, and v1's `stage`, `cdr_mask`, `heldout_sets`, `order`, `connect` (unchanged).
 - **Produces:**
   - `cdrh3_heldout(work: Path, seed: int, n: int) -> dict[str, list[dict]]`, keyed `eval_cdrh3` and `test_cdrh3`, with rows in v1's held-out schema.
-  - `.work/heldout.parquet`: one `antiref90` column holding v1's 20,000 IDs plus the new 10,000.
+  - `.work/heldout.parquet`: one `antiref90` column holding v1's 20,000 IDs plus the new 5,000.
   - `screen(work: Path, queries: list[str], cap: float) -> None`: writes `.work/screened.parquet` with columns `antiref99` (string) and `qid` (int32), and prints:
     - `screen removed: <n> of <total> (<pct>%)`
     - `screen cdr3s over 1000: <n>`
@@ -161,7 +163,7 @@ limit = 0
   - Input: the distinct `antiref99` of manifest rows outside every held-out AntiRef90 cluster, joined to their sequences. Have DuckDB write them as `cpus` parquet parts under `.work/screen_in/`.
   - Run a `multiprocessing.Pool(cpus)` over the parts. Each worker:
     - builds one `PieceIndex` over the queries;
-    - for each sequence, takes `anchored(seq)` and matches each candidate; or, with none, runs `semiglobal_within(q, window, len(q) // 4)` for each `q` in `idx.candidates(window)`;
+    - for each sequence, takes `anchored(seq)` and matches each candidate; or, with none, runs `semiglobal_within(q, window, len(q) * 3 // 17)` for each `q` in `idx.candidates(window)`;
     - writes its `(antiref99, qid)` hits.
   - Concatenate the hits into `screened.parquet`, then print the counts and enforce the cap.
 - [ ] **Step 3: Wire them into the main flow after v1's held-out stage,** each skipped when its output exists:
@@ -172,12 +174,12 @@ limit = 0
   - Locally set `limit = 3000000`, `heldout = 200`, `cdrh3_heldout = 200`, never committed.
   - If v1's `.work/` downloads still exist on bcr, hard-link the two `.gz` files into `<out>/.work/` first; `download()` trusts files of the right size.
   - Run: `sbatch --partition=cpu --cpus-per-task=32 --mem=256G --time=03:00:00 --wrap "srun --container-image=ghcr.io#brineylab/toolshed/datascience:1.2.0 --container-mounts=<repo>,<out> <repo>/datasets/oplm-antibody-cdrh3/recipe/build <out>"`.
-  - Expected: the self-check passes, then the `cdrh3` and `screen` lines print, with `screen removed` under 3%. The train stage that follows is still v1's until Task 3 replaces it; ignore its output.
+  - Expected: the self-check passes, then the `cdrh3` and `screen` lines print, with `screen removed` under 5%. The train stage that follows is still v1's until Task 3 replaces it; ignore its output.
 - [ ] **Step 5: Measure screen throughput** from the dry run (sequences per second per CPU) and extrapolate to about 316M sequences on 32 CPUs.
   - If the extrapolation exceeds 3 hours, move the anchored match into DuckDB: explode pieces and candidates, join on equal strings, then `levenshtein()`. Keep the Python path for unanchored sequences.
   - Record the measured rate in the commit message.
 - [ ] **Step 6: Commit.**
-  - `git commit -m "oplm-antibody-cdrh3 holds out 10,000 heavy chains with mutually distinct CDR3s and screens every AntiRef99 train sequence against them"`
+  - `git commit -m "oplm-antibody-cdrh3 holds out 5,000 heavy chains with mutually distinct CDR3s and screens every AntiRef99 train sequence against them"`
 
 ### Task 3: The four train sets
 
@@ -223,14 +225,14 @@ limit = 0
   - `TRAIN_COLUMNS` covers the four `antiref{90,92,94,96}` folders, with v1's member checks unchanged. A promoted row's `sequence_id` and `sequence` are its first member's, so `member_ids[0] == sequence_id` still holds.
   - v1's four files match the Global Constraints sha256 values.
   - Every `*_cdrh3` row is `IGH`, with a CDR3 of at least 5 residues.
-  - No two CDR3s across `eval_cdrh3` and `test_cdrh3` are near. Check in DuckDB over a table `c(id, cdr3)` of all 10,000:
+  - No two CDR3s across `eval_cdrh3` and `test_cdrh3` are near. Check in DuckDB over a table `c(id, cdr3)` of all 5,000:
     ```sql
     SELECT a.id, b.id FROM c a JOIN c b ON a.id < b.id
-      AND abs(length(a.cdr3) - length(b.cdr3)) <= greatest(length(a.cdr3), length(b.cdr3)) // 5
-    WHERE levenshtein(a.cdr3, b.cdr3) <= greatest(length(a.cdr3), length(b.cdr3)) // 5
+      AND abs(length(a.cdr3) - length(b.cdr3)) <= greatest(length(a.cdr3), length(b.cdr3)) * 3 // 20
+    WHERE levenshtein(a.cdr3, b.cdr3) <= greatest(length(a.cdr3), length(b.cdr3)) * 3 // 20
     ```
-    Expect zero rows. Integer `// 5` is `floor(0.2 * x)`.
-  - **The screen holds on a sample.** Take the first 1,000 rows of shard 0 of each folder. For each member, take its anchored candidates (regex in the test), cross-join them in DuckDB with the 10,000 held-out CDR3s, and apply the same `levenshtein` predicate. Expect zero rows. Members with no anchored candidate are checked with a semi-global edit distance (a small Sellers function in the test) within `len(q) // 4`.
+    Expect zero rows. Integer `* 3 // 20` is `floor(0.15 * x)`.
+  - **The screen holds on a sample.** Take the first 1,000 rows of shard 0 of each folder. For each member, take its anchored candidates (regex in the test), cross-join them in DuckDB with the 5,000 held-out CDR3s, and apply the same `levenshtein` predicate. Expect zero rows. Members with no anchored candidate are checked with a semi-global edit distance (a small Sellers function in the test) within `len(q) * 3 // 17`.
   - Train row floors: `FLOOR = {level: 0 ...}` until Task 5 sets them.
 - [ ] **Step 2: Run the test on the Task 3 dry-run output.**
   - Expected: `ok`, except the sha256 check. A `limit` dry run holds different v1 files, so the sha256 check is skipped when `params["limit"]` is non-zero; print `skip sha256 (limit)`.
@@ -238,7 +240,7 @@ limit = 0
   - overwrite one `test_cdrh3` row's `sequence` and `cdr_mask_aa` with an `eval_cdrh3` row's; expect the near-pairs check to fail;
   - append a row to shard 0 of `antiref92/train` whose member is the `eval_cdrh3` heavy chain itself; expect the screen check to fail.
 - [ ] **Step 4: Commit.**
-  - `git commit -m "oplm-antibody-cdrh3's test checks v1's files by hash, the CDR3 holdout's 80% separation, and the screen on sampled members"`
+  - `git commit -m "oplm-antibody-cdrh3's test checks v1's files by hash, the CDR3 holdout's 85% separation, and the screen on sampled members"`
 
 ### Task 5: Full build on bcr, skill, record, PR
 
@@ -253,7 +255,7 @@ limit = 0
   - If the screen's tripwire fires, stop and bring the `screen` lines to the human. Do not raise `screen_max`.
 - [ ] **Step 2: Set `FLOOR`** to `int(0.9 * rows)` per folder from the printed `rows` lines, and rerun the test. Expected: `ok`.
 - [ ] **Step 3: Write `SKILL.md`** with v1's sections:
-  - **Frontmatter:** as in Global Constraints. `description` says the dataset is a heavy-chain CDR3-identity holdout at 80% plus four AntiRef cluster levels with AntiRef99 members, for OPLM's antibody anneal.
+  - **Frontmatter:** as in Global Constraints. `description` says the dataset is a heavy-chain CDR3-identity holdout at 85% plus four AntiRef cluster levels with AntiRef99 members, for OPLM's antibody anneal.
   - **Files:** the six held-out files and four folders. State that a row's `sequence` is AntiRef's representative unless the screen removed it.
   - **Reading it:** always `sample_members: true`.
   - **Recipe:** the spec's §5, with the parameters.
