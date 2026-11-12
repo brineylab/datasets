@@ -7,9 +7,11 @@ members and AntiRef99 representatives, sharded as OPLM's uniref70 and deepclust7
 Stages under <out>/.work/, each skipped when a rerun finds it finished. Prints `held out failed numbering` lines,
 then `rows` and `locus` lines last.
 """
+import collections
 import gzip
 import hashlib
 import itertools
+import multiprocessing
 import os
 import re
 import shutil
@@ -117,6 +119,17 @@ class PieceIndex:
         return min((q for q in self.candidates(cand) if near(self.queries[q], cand)), default=None)
 
 
+def screened_by(idx: PieceIndex, sequence: str) -> int | None:
+    """The held-out CDR3 (qid) a train sequence carries at 80% identity, or None. Anchored candidates are compared
+    whole; a sequence with none falls back to a semi-global search of its window within floor(0.25 x query length)."""
+    cands = anchored(sequence)
+    if cands:
+        return min((q for c in cands if (q := idx.match(c)) is not None), default=None)
+    window = sequence[len(sequence) // 2:]
+    return next((q for q in sorted(idx.candidates(window))
+                 if semiglobal_within(idx.queries[q], window, len(idx.queries[q]) // 4)), None)
+
+
 def selfcheck() -> None:
     """Known answers for the CDR3 matching, run before every build. KNOWN's CDR3 is 21 residues, so 4 edits are near."""
     q = "ARSPYSSSWPGYYYYYYGMDV"
@@ -134,6 +147,10 @@ def selfcheck() -> None:
     idx.add(q, 7)
     assert idx.match(q) == 7 and idx.match("GRSPYSASWPGYYAYYYGMDI") == 7
     assert idx.match("ARDYYYYYGMDV") is None
+    loose = KNOWN[0].replace("WGQG", "WAQA")  # no [WF]G.G anchor, so only the fallback can find it
+    assert screened_by(idx, KNOWN[0]) == 7
+    assert anchored(loose) == [] and screened_by(idx, loose) == 7
+    assert screened_by(idx, KNOWN[0].replace(q, "AKDLGGNWFDP")) is None
 
 
 def fetch_range(url: str, part: Path, lo: int, hi: int) -> None:
@@ -250,6 +267,79 @@ def heldout_sets(work: Path, n: int) -> dict[str, list[dict]]:
     return sets
 
 
+def cdrh3_heldout(work: Path, seed: int, n: int, exclude: set[str]) -> dict[str, list[dict]]:
+    """Heavy-chain AntiRef90 representatives outside `exclude`, in the seeded order md5('<seed>:<antiref90>'), kept
+    when numbered with a CDR3 of 5 or more residues that is under 80% identical to every CDR3 kept before it. The
+    first n kept are eval_cdrh3, the next n test_cdrh3."""
+    anarcii = Anarcii(seq_type="antibody", mode="accuracy", cpu=True, ncpu=cpus)
+    rows = connect().execute(
+        f"SELECT m.antiref90, s.sequence FROM (SELECT DISTINCT antiref90 FROM '{work / 'manifest.parquet'}') m "
+        f"JOIN '{work / 'sequences.parquet'}' s ON s.sequence_id = m.antiref90 ORDER BY md5('{seed}:' || m.antiref90)")
+    idx, kept, tried, rejected = PieceIndex(), [], 0, 0
+    while len(kept) < 2 * n and (pool := rows.fetchmany(int(2.4 * n))):
+        pool = [(sid, seq) for sid, seq in pool if sid not in exclude]
+        numbered = anarcii.number(dict(pool))
+        for sid, sequence in pool:
+            if len(kept) == 2 * n:
+                break
+            tried += 1
+            result = numbered.get(sid, {"chain_type": "F"})
+            mask = cdr_mask(result["numbering"], sequence) if result["chain_type"] == "H" else None
+            cdr3 = "".join(a for a, d in zip(sequence, mask or "") if d == "3")
+            if len(cdr3) < 5:
+                continue
+            if idx.match(cdr3) is not None:
+                rejected += 1
+                continue
+            idx.add(cdr3, len(kept))
+            kept.append({"sequence_id": sid, "sequence": sequence, "locus": "IGH", "cdr_mask_aa": mask})
+    if len(kept) < 2 * n:
+        sys.exit(f"cdrh3: {len(kept)} of {2 * n} after {tried} candidates")
+    print(f"cdrh3 candidates tried: {tried}")
+    print(f"cdrh3 rejected near: {rejected}")
+    return {"eval_cdrh3": kept[:n], "test_cdrh3": kept[n:]}
+
+
+_screen_idx: PieceIndex | None = None
+
+
+def _screen_group(task: tuple[str, int]) -> list[tuple[str, int]]:
+    path, group = task
+    t = pq.ParquetFile(path).read_row_group(group, use_threads=False)
+    return [(sid, q) for sid, seq in zip(t["antiref99"].to_pylist(), t["sequence"].to_pylist())
+            if (q := screened_by(_screen_idx, seq)) is not None]
+
+
+def screen(work: Path, queries: list[str], cap: float) -> None:
+    """Every AntiRef99 sequence outside the held-out AntiRef90 clusters that carries a held-out heavy CDR3 at 80%
+    identity, as .work/screened.parquet (antiref99, qid). Stops the build when it removes more than `cap`."""
+    global _screen_idx
+    src = work / "screen_in.parquet"
+    if not src.is_file():
+        con = connect()
+        con.execute(f"COPY (SELECT d.antiref99, s.sequence FROM (SELECT DISTINCT antiref99 FROM '{work / 'manifest.parquet'}' "
+                    f"ANTI JOIN '{work / 'heldout.parquet'}' USING (antiref90)) d JOIN '{work / 'sequences.parquet'}' s "
+                    f"ON s.sequence_id = d.antiref99) TO '{src}.part' (FORMAT parquet, ROW_GROUP_SIZE 100000)")
+        con.close()
+        os.rename(f"{src}.part", src)
+    _screen_idx = PieceIndex()
+    for qid, q in enumerate(queries):
+        _screen_idx.add(q, qid)
+    meta = pq.ParquetFile(src).metadata
+    # fork, not spawn: spawn would rerun this script's top level in every worker
+    with multiprocessing.get_context("fork").Pool(cpus) as pool:
+        hits = [h for part in pool.imap_unordered(_screen_group, [(str(src), g) for g in range(meta.num_row_groups)])
+                for h in part]
+    total, per_query = meta.num_rows, collections.Counter(q for _, q in hits)
+    print(f"screen removed: {len(hits)} of {total} ({100 * len(hits) / total:.3f}%)")
+    print(f"screen cdr3s over 1000: {sum(c > 1000 for c in per_query.values())}")
+    print(f"screen largest: {max(per_query.values(), default=0)}")
+    if len(hits) / total > cap:
+        sys.exit(f"screen removed {100 * len(hits) / total:.3f}% > {100 * cap:g}%")
+    pq.write_table(pa.table({"antiref99": [h[0] for h in hits], "qid": pa.array([h[1] for h in hits], pa.int32())},
+                            schema=pa.schema([("antiref99", pa.string()), ("qid", pa.int32())])), work / "screened.parquet")
+
+
 def write_shards(batches: pa.RecordBatchReader, folder: Path, shard_rows: int) -> None:
     tmp = folder.with_suffix(".part")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -321,7 +411,13 @@ if not (work / "heldout.parquet").is_file():
     for name, rows in heldout_sets(work, params["heldout"]).items():
         pq.write_table(pa.Table.from_pylist(rows), out / f"{name}.parquet", compression="zstd")
     ids = [r["sequence_id"] for name in ("eval", "test") for s in STRATA for r in pq.read_table(out / f"{name}_{s}.parquet").to_pylist()]
+    for name, rows in cdrh3_heldout(work, params["cdrh3_seed"], params["cdrh3_heldout"], set(ids)).items():
+        pq.write_table(pa.Table.from_pylist(rows), out / f"{name}.parquet", compression="zstd")
+        ids += [r["sequence_id"] for r in rows]
     pq.write_table(pa.table({"antiref90": ids}), work / "heldout.parquet")
+if not (work / "screened.parquet").is_file():
+    held = [r for name in ("eval_cdrh3", "test_cdrh3") for r in pq.read_table(out / f"{name}.parquet").to_pylist()]
+    screen(work, ["".join(a for a, d in zip(r["sequence"], r["cdr_mask_aa"]) if d == "3") for r in held], params["screen_max"])
 train(work, params["shard_rows"])
 
 con = connect()
