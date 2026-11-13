@@ -20,6 +20,8 @@ So the question now is which antibody **train set** generalizes best at the fixe
 
 **Revised 2026-11-12, after measuring the screen.** Scored against about 7,900 real heavy CDR3s, a 24,000-sequence train sample showed the screen at 80% would remove about 10% of train at 10,000 held out, against a 3% tripwire. Removal scales mostly with the number held out, not with CDR3 length. The PI chose **85% CDR3 identity at any length** (same-length-only matching saved little once at 85%) and **2,500 + 2,500** held-out heavy chains, with the tripwire at **5%** (about 4.3% expected). Conserved Cys104 and Trp118 were already outside the compared CDR3 (IMGT 105–117). Below, every threshold, size and bound reflects this revision.
 
+**Revised 2026-11-13, after the first full build.** The screen removed 5.134% of AntiRef99 train sequences (16,222,603 of 315,971,320), over the 5% tripwire. Removal is concentrated in common CDR3s: 1,472 held-out CDR3s each remove more than 1,000 sequences, the largest 358,021. The PI kept the held-out sets as drawn and raised the tripwire to **6%**.
+
 - **Holdout: CDR3 identity, from AntiRef, first.** A donor holdout needs an OAS rebuild with donor annotations, and waits.
 - **Heavy chains only, at 85% CDR3 identity.** No heavy-chain CDR3 left in training is 85% or more identical to a held-out heavy chain's CDR3. Light chains stay on v1's AntiRef90-cluster holdout. Their CDR3s are low-diversity: holding them out by CDR3 identity would gut light-chain training or leave almost nothing unseen.
 - **Train sets to compare, all at 1.5% of decay tokens on the 1/35 proxy:**
@@ -97,7 +99,7 @@ Remove from train:
 A public heavy CDR3 drawn into the holdout takes its whole family out of train. That is the point, and the count makes it visible.
 
 - **No per-CDR3 cap.** A cap would bias the eval away from public CDR3s **(call)**.
-- **Tripwire.** If the screen removes more than 5% of AntiRef99 train sequences, the build stops so a person can look before anything publishes **(call)**.
+- **Tripwire.** If the screen removes more than 6% of AntiRef99 train sequences, the build stops so a person can look before anything publishes **(call)**.
 
 ### 5.4 Train sets
 
@@ -132,7 +134,7 @@ v1's checks, plus:
 - **the screen holds.** For a sample of train rows (several thousand members per folder), no window is within the 85% bound of any held-out heavy CDR3. The test reruns the semi-global check on that sample; the build's own index is not trusted;
 - all four folders' member sets have the same total count;
 - each sampled row's first member is itself;
-- the screen removed no more than 5% of AntiRef99 train sequences.
+- the screen removed no more than 6% of AntiRef99 train sequences.
 
 ## 7. Compute
 
