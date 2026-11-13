@@ -349,9 +349,10 @@ def _screen_group(task: tuple[str, int]) -> list[tuple[str, int]]:
             if (q := screened_by(_screen_idx, seq)) is not None]
 
 
-def screen(work: Path, queries: list[str], cap: float) -> None:
+def screen(work: Path, queries: list[str]) -> None:
     """Every AntiRef99 sequence outside the held-out AntiRef90 clusters that carries a held-out heavy CDR3 at 85%
-    identity, as .work/screened.parquet (antiref99, qid). Stops the build when it removes more than `cap`."""
+    identity, as .work/screened.parquet (antiref99, qid). Written before the tripwire is checked, so a rerun with a
+    raised `screen_max` reuses it."""
     global _screen_idx
     src = work / "screen_in.parquet"
     if not src.is_file():
@@ -373,8 +374,6 @@ def screen(work: Path, queries: list[str], cap: float) -> None:
     print(f"screen removed: {len(hits)} of {total} ({100 * len(hits) / total:.3f}%)")
     print(f"screen cdr3s over 1000: {sum(c > 1000 for c in per_query.values())}")
     print(f"screen largest: {max(per_query.values(), default=0)}")
-    if len(hits) / total > cap:
-        sys.exit(f"screen removed {100 * len(hits) / total:.3f}% > {100 * cap:g}%")
     pq.write_table(pa.table({"antiref99": [h[0] for h in hits], "qid": pa.array([h[1] for h in hits], pa.int32())},
                             schema=pa.schema([("antiref99", pa.string()), ("qid", pa.int32())])), work / "screened.parquet")
 
@@ -471,7 +470,10 @@ if not (work / "heldout.parquet").is_file():
     pq.write_table(pa.table({"antiref90": ids}), work / "heldout.parquet")
 if not (work / "screened.parquet").is_file():
     held = [r for name in ("eval_cdrh3", "test_cdrh3") for r in pq.read_table(out / f"{name}.parquet").to_pylist()]
-    screen(work, ["".join(a for a, d in zip(r["sequence"], r["cdr_mask_aa"]) if d == "3") for r in held], params["screen_max"])
+    screen(work, ["".join(a for a, d in zip(r["sequence"], r["cdr_mask_aa"]) if d == "3") for r in held])
+removed = pq.ParquetFile(work / "screened.parquet").metadata.num_rows / pq.ParquetFile(work / "screen_in.parquet").metadata.num_rows
+if removed > params["screen_max"]:
+    sys.exit(f"screen removed {100 * removed:.3f}% > {100 * params['screen_max']:g}%")
 train(work, params["shard_rows"])
 
 con = connect()
