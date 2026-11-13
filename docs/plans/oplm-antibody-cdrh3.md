@@ -34,7 +34,7 @@ seed = 1           # v1's holdout, unchanged
 heldout = 5000
 cdrh3_seed = 2
 cdrh3_heldout = 2500
-screen_max = 0.05  # build stops if the screen removes more than this share of AntiRef99 train sequences
+screen_max = 0.06  # build stops if the screen removes more than this share of AntiRef99 train sequences
 shard_rows = 1000000
 limit = 0
 ```

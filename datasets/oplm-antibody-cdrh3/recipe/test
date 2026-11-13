@@ -15,7 +15,7 @@ import pyarrow.parquet as pq
 
 params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
 TRAIN_LEVELS = ["antiref90", "antiref92", "antiref94", "antiref96"]
-FLOOR = {level: 0 for level in TRAIN_LEVELS}  # rows: 90% of the first full build's
+FLOOR = {"antiref90": 137116466, "antiref92": 145652763, "antiref94": 157575445, "antiref96": 179499116}  # rows: 90% of the first full build's
 V1 = {"eval_singletons": "f28027d3b65fc11e1ac790674d5be1885775973c072da9dfd4e4e91899648552",
       "eval_gte2": "862f73fe8c1faadcf98c50c5b6c83742dac6e6fc36c1b1331ee4896e6ee28c99",
       "test_singletons": "cc6381e9e0fedb8c447925c9d369ef57e219237ab61f60055166b27ed8688758",
