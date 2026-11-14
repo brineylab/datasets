@@ -56,7 +56,7 @@ So the question now is which antibody **train set** generalizes best at the fixe
 
 Same source as v1: AntiRef v2022.12.14, the Zenodo manifest and FASTA, with the same MD5s and the same nested linclust levels (100, 99, 98, 96, 94, 92, 90).
 
-This is a **new dataset**, not a v1 version. The holdout changes what train contains, so results aren't comparable to v1's train sets (repository rule: a threshold change is a new dataset). Name: `oplm-antibody-cdrh3` **(call)**.
+~~This is a **new dataset**, not a v1 version. Name: `oplm-antibody-cdrh3`.~~ **Revised 2026-11-13 (PI):** this is **`oplm-antibody-sequences` 2.0.0**, a new version of the same dataset: the same data with a different eval and test holdout. Against D3 by the PI's decision; the skill says so. 2.0.0 drops 1.0.0's `antiref99/train` (PI). Train results are not comparable across the two versions.
 
 ## 5. Steps
 

@@ -16,6 +16,8 @@
 
 **Revised 2026-11-12 (PI):** 85% CDR3 identity at any length, 2,500 + 2,500 held out, tripwire 5%, raised to 6% on 2026-11-13 after the first full build removed 5.134% (PI). The spec's §2 says why. Tasks 1–4 were first written at 80%; their code is updated to these values.
 
+**Revised 2026-11-13 (PI), after the first push:** the dataset is published as **`oplm-antibody-sequences` 2.0.0**, not as a new `oplm-antibody-cdrh3`; the recipe and skill live in `datasets/oplm-antibody-sequences/`, the record is `results/oplm-antibody-sequences/2.0.0.txt`, and 2.0.0 has no `antiref99/train`. Wherever a task below says `oplm-antibody-cdrh3` for the Hub repository, the directory or the download path, read `oplm-antibody-sequences` 2.0.0. The candidate pushed to `brineylab/oplm-antibody-cdrh3` (Hub commit 9ab426cb) is abandoned; the PI deletes that repository.
+
 **Datasets repository** (its `AGENTS.md`, binding):
 - Bytes on the Hub, never in git. A recipe never pip-installs.
 - Variants are datasets: copy the sibling's directory, change what differs.
