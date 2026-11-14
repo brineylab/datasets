@@ -1,111 +1,112 @@
 ---
 name: oplm-antibody-sequences
-description: "Human antibody heavy and light chains from AntiRef v2022.12.14 (OAS, healthy donors' blood), laid out as OPLM's sequence data: AntiRef96 clusters with their AntiRef99 members, AntiRef99 representatives, and held-out AntiRef90 clusters with locus and an IMGT CDR mask. Reach for it to add antibodies to OPLM training or to measure CDR3 loss."
+description: "Human antibody heavy and light chains from AntiRef v2022.12.14 (OAS, healthy donors' blood), laid out as OPLM's sequence data, with a heavy-chain CDR3-identity holdout at 85%: 5,000 held-out heavy chains whose CDR3s have no 85%-identical CDR3 left in training, 1.0.0's AntiRef90-cluster eval and test files unchanged, and four screened train sets (AntiRef90, 92, 94 and 96 clusters with AntiRef99 members). Reach for it to compare antibody train sets in OPLM's anneal, or to measure CDR3 loss on CDR3s the model has not seen."
 metadata:
-  version: 1.0.0
+  version: 2.0.0
   tools: datascience@1.2.0
   license: cc-by-4.0
 ---
 # oplm-antibody-sequences
 
-Hub: `brineylab/oplm-antibody-sequences`, tag `v1.0.0`
+Hub: `brineylab/oplm-antibody-sequences`, tag `v2.0.0`
 
-A pilot: does a decay with antibodies improve OPLM's antibody performance, judged on CDR3, against a decay on protein sequences only? It is built from the published AntiRef as it stands (Briney 2023, *Bioinformatics Advances*, [10.1093/bioadv/vbad109](https://doi.org/10.1093/bioadv/vbad109)). A rebuild from current OAS, with donors and germline annotations, waits on the pilot.
+Version 1.0.0 held out whole AntiRef90 clusters and nothing more, so 27% of eval_gte2's heavy chains had an exact copy of their CDR3 in train. Version 2.0.0 adds a holdout where "unseen" means unseen: no heavy-chain CDR3 left in training is 85% or more identical to a held-out heavy chain's CDR3. Its four train sets share that holdout and that screen, so OPLM decays that differ only in train set can be compared (briney/oplm#78). It is built from the published AntiRef (Briney 2023, *Bioinformatics Advances*, [10.1093/bioadv/vbad109](https://doi.org/10.1093/bioadv/vbad109)). A donor holdout waits on a rebuild from current OAS.
 
 ## Files
 
-The layout is `brineylab/oplm-sequence-data`'s, one folder per training source:
-
 ```
-antiref96/train/shard-00000.parquet …   one row per AntiRef96 cluster
-antiref99/train/shard-00000.parquet …   one row per AntiRef99 representative
+antiref90/train/shard-00000.parquet …   one row per AntiRef90 cluster
+antiref92/train/ …  antiref94/train/ …  antiref96/train/ …
+eval_cdrh3.parquet  test_cdrh3.parquet
 eval_singletons.parquet  eval_gte2.parquet  test_singletons.parquet  test_gte2.parquet
 ```
 
-- **`antiref96/train/`**, uniref70's columns:
-  - `sequence_id`: the AntiRef96 representative's AntiRef UUID;
-  - `sequence`: its amino acids;
-  - `member_ids`, `member_sequences`: the AntiRef99 representatives inside the cluster, the representative's own entry first.
-- **`antiref99/train/`**, deepclust70's columns: `sequence_id`, `sequence`.
-- **Shards:** 1,000,000 rows each (the last fewer), row groups of 10,000, zstd. Rows are in a seeded global shuffle (`md5('1:<sequence_id>')`), so any subset of shards is a uniform sample.
-- **Eval and test** each hold 5,000 representatives of held-out AntiRef90 clusters: `_singletons` from clusters of one AntiRef100 sequence, `_gte2` from clusters of two or more. Heavy and light chains are mixed. Columns:
+- **`antiref{90,92,94,96}/train/`**, uniref70's columns:
+  - `sequence_id`, `sequence`: the cluster's representative, its AntiRef UUID and amino acids. **A row's `sequence` is AntiRef's representative unless the screen removed it**; then the cluster's first surviving member, in the seeded order, takes its place;
+  - `member_ids`, `member_sequences`: the surviving AntiRef99 representatives inside the cluster, the row's own entry first.
+
+  All four folders hold the same 299,748,717 AntiRef99 sequences, grouped differently, so the four train sets differ only in how training draws from them.
+- **Shards:** 1,000,000 rows each (the last fewer), row groups of 10,000, zstd. Rows are in a seeded global shuffle (`md5('1:<level id>')`), so any subset of shards is a uniform sample. Members follow the representative in `md5('1:<antiref99>')` order.
+- **`eval_cdrh3`, `test_cdrh3`:** 2,500 heavy chains each, the CDR3-identity holdout. Every CDR3 has at least 5 residues, and no two CDR3s across both files are 85% identical.
+- **`eval_singletons`, `eval_gte2`, `test_singletons`, `test_gte2`:** 1.0.0's files, byte-identical, so earlier #78 numbers stay comparable. 5,000 representatives of held-out AntiRef90 clusters each, heavy and light mixed.
+- **Held-out columns**, all six files:
   - `sequence_id`, `sequence`;
-  - `locus`: `IGH`, `IGK`, or `IGL`;
-  - `cdr_mask_aa`: abstar 0.9.0's CDR mask, one digit per residue of `sequence`: `0` framework, `1` CDR1, `2` CDR2, `3` CDR3. It uses IMGT regions (CDR1 27–38, CDR2 56–65, CDR3 105–117, insertions with their base position) from ANARCII 2.0.8's numbering.
+  - `locus`: `IGH`, `IGK`, or `IGL` (`IGH` only in the `_cdrh3` files);
+  - `cdr_mask_aa`: one digit per residue of `sequence`: `0` framework, `1` CDR1, `2` CDR2, `3` CDR3, from ANARCII 2.0.8's IMGT numbering (CDR1 27–38, CDR2 56–65, CDR3 105–117).
 
-  Every member of a held-out cluster is out of both train sets.
+  Every member of a held-out AntiRef90 cluster is out of every train set.
 
-`sequence` is the variable domain, FWR1 through FWR4: the span abstar's `sequence_vdj_aa` covers.
+`sequence` is the variable domain, FWR1 through FWR4.
 
 ## Reading it
 
 ```python
 from huggingface_hub import snapshot_download
-path = snapshot_download("brineylab/oplm-antibody-sequences", repo_type="dataset", revision="v1.0.0")
+path = snapshot_download("brineylab/oplm-antibody-sequences", repo_type="dataset", revision="v2.0.0")
 ```
 
-In OPLM, a `data.train` source is a folder of shards:
-- **AntiRef96 representatives:** `antiref96/train` with `sample_members: false`.
-- **AntiRef96 clusters sampled to one AntiRef99 member:** `antiref96/train` with `sample_members: true`.
-- **AntiRef99 representatives:** `antiref99/train`.
-
-The four held-out files are `type: sequence` evals. The CDR3 eval, which scores only positions where `cdr_mask_aa` is `3` and runs per `locus`, is briney/oplm#85.
+In OPLM, a `data.train` source is one of the four folders, **always with `sample_members: true`**: a row's representative may stand in for a removed one, so the representatives alone are not AntiRef's. The six held-out files are `type: sequence` evals; OPLM's `antibody_cdr3` eval reads them unchanged and scores only positions where `cdr_mask_aa` is `3`, per `locus`. Read heavy-only metrics on the `_cdrh3` files.
 
 ## Recipe
 
-**Source:** AntiRef v2022.12.14 on Zenodo (CC BY 4.0), pulled 2026-11-09:
+**Source:** AntiRef v2022.12.14 on Zenodo (CC BY 4.0), pulled 2026-11-09, the same two files as 1.0.0:
 - record 7474336, `antiref_cluster-manifest.csv.gz` (14,054,641,207 bytes, MD5 `18fcf6376702a2d23e2acdc32f1fd40a`): one row per AntiRef100 sequence, with its representative at 100, 99, 98, 96, 94, 92, and 90% identity;
 - record 7474658, `antiref100.fasta.gz` (18,496,427,276 bytes, MD5 `4a82d4be0c493377668fac9730aca866`): each sequence's UUID and amino acids.
 
 The recipe refuses a download whose MD5 differs. AntiRef's clustering was MMseqs2 linclust, nested: each threshold clustered the previous one's representatives, with `-c 0.8 --cov-mode 0`.
 
-**Steps**, one job in `datascience@1.2.0`:
+**Identity.** Two CDR3s `a` and `b` are 85% identical when `levenshtein(a, b) <= max(len(a), len(b)) * 3 // 20`. Length differences count against identity.
 
-1. **Stage** the manifest and the FASTA as parquet. Every manifest ID must have a sequence, and every sequence a manifest row.
-2. **Hold out.**
-   - Put the AntiRef90 clusters in the seeded order, `md5('<seed>:<antiref90>')`, and walk singletons and gte2 separately.
-   - Number each representative with ANARCII (`seq_type="antibody"`, `mode="accuracy"`, IMGT). Keep it when its chain type is H, K, or L, every residue is numbered, and it has a CDR3.
-   - The first `heldout` kept are eval, the next `heldout` test. Candidates that fail numbering stay in train; the build prints how many.
-   - Before any of this, the build numbers one known heavy chain and stops if its mask moved.
-3. **Train.** Drop every manifest row in a held-out cluster. AntiRef99 rows are the distinct `antiref99`. AntiRef96 rows are the distinct `antiref96`, with their distinct `antiref99` as members; the build stops if a representative is not its own first member. Both are written in the seeded order.
+**Steps**, one job in `datascience@1.2.0`. Each stage lives under `<out>/.work/` and is skipped when a rerun finds it finished. A self-check of the matching code against known answers runs first.
+
+1. **Stage** the manifest and the FASTA as parquet, as 1.0.0.
+2. **1.0.0's holdout**, unchanged (`seed = 1`, `heldout = 5000`): its four files come out byte-identical.
+3. **The heavy CDR3 holdout.** Walk the remaining AntiRef90 representatives in `md5('<cdrh3_seed>:<antiref90>')` order and number each with ANARCII (IMGT). Keep a candidate when its chain is H, every residue is numbered, its CDR3 has at least 5 residues, and its CDR3 is not 85% identical to one already kept. The first 2,500 kept are eval, the next 2,500 test.
+4. **The screen.** Every AntiRef99 sequence outside the held-out AntiRef90 clusters is checked against the 5,000 held-out CDR3s, on its C-terminal half (`sequence[len(sequence) // 2:]`), which always holds the CDR3:
+   - **anchored:** every substring of 3–40 residues right after a `C` and right before a `[WF]G.G` is a candidate CDR3. The sequence goes when any candidate is 85% identical to a held-out CDR3. Trying every boundary pair means a misplaced boundary can't hide a match, and matching end to end keeps shared D or J stretches from removing unrelated antibodies;
+   - **unanchored** (no candidate): the sequence goes when a held-out CDR3 `q` aligns semi-globally anywhere in the half within `len(q) * 3 // 17` edits, a superset of the 85% bound for any substring length.
+
+   A pigeonhole index (an exact piece of the query must appear in any match) narrows the candidates before alignment. Hits are written to `.work/screened.parquet`, then the tripwire is checked: the build stops if the screen removed more than `screen_max` of AntiRef99 sequences. A rerun with a raised `screen_max` reuses the hits.
+5. **Train.** Drop held-out clusters and screened sequences, then write each level's clusters with their surviving AntiRef99 members, in the seeded order; a cluster with no survivor is dropped. The build stops if a representative is not among its own AntiRef99 members, or if the four folders' member totals differ.
 
 `params.toml`:
-- `seed = 1`, `heldout = 5000`, `shard_rows = 1000000`;
+- `seed = 1`, `heldout = 5000`: 1.0.0's holdout;
+- `cdrh3_seed = 2`, `cdrh3_heldout = 2500`;
+- `screen_max = 0.06`;
+- `shard_rows = 1000000`;
 - `limit = 0`: whole AntiRef90 clusters, for a developer's dry run. 0 is all, and the published version has 0.
 
-**The test** checks:
-- the files, their columns, and `heldout` rows in each held-out file;
+**The test** checks, with its own matching code (DuckDB's `levenshtein` and a q-gram-filtered semi-global search), not the build's:
+- the files, their columns and row counts; 1.0.0's four by sha256;
 - the shards' names and sizes, and each train folder against its floor;
-- no `sequence_id` in two held-out files or in a held-out file and a train shard (first and last);
-- each mask's length, digits, and single CDR3 run;
-- `locus`;
-- representative-first members.
+- `_cdrh3` rows are `IGH` with a CDR3 of at least 5; masks' length, digits and single CDR3 run;
+- no two held-out CDR3s 85% identical;
+- no `sequence_id` in two held-out files, or in a held-out file and a train shard (first and last of each folder);
+- representative-first members;
+- **the screen holds** on 1,000 rows of each folder's first shard: no anchored candidate is 85% identical to a held-out CDR3, and 200 unanchored members carry none by the semi-global search.
 
 ## Compute
 
-Measured on the first full build, on a workstation under podman with 16 CPUs and 100 GB of memory:
-- **Time:** about 37 minutes.
-  - Download, 32 parallel range requests: 11 min.
-  - Stage: 9 min.
-  - Hold out (ANARCII on 16 CPUs): 5 min.
-  - AntiRef99: 3 min.
-  - AntiRef96: 9 min.
-- **Memory:** the container's peak reached its 100 GB limit. That peak counts page cache, and DuckDB spills past 80% of the limit, so 100 GB is enough but not much more than enough; ask 128 GB.
-- **Disk:**
-  - `.work/`: 89 GB (32.5 GB of downloads and 62.5 GB staged);
-  - DuckDB's spill: up to about 90 GB;
-  - the output: 40 GB (AntiRef96 24 GB, AntiRef99 16 GB).
-- **Rows:** AntiRef96 210,559,202 in 211 shards; AntiRef99 315,983,206 in 316 shards. The test's floors are 90% of these.
+Measured on the first full build, on bcr's `cpu` partition with 32 CPUs and 256 GB of memory, run as flyloft jobs:
+- **Time:** about 7.5 hours from nothing.
+  - Download, stage and 1.0.0's holdout: about 50 min.
+  - The CDR3 holdout: 5 min (11,478 candidates tried, 275 rejected as near a kept CDR3).
+  - The screen: about 5.7 hours. Real data ran about four times slower than the synthetic benchmark (217 µs per anchored sequence): public CDR3s make many full alignments.
+  - The four train folders and the test: about 45 min.
+- **Memory:** not measured (flyloft did not return `sacct`); 256 GB was enough.
+- **Disk:** `.work/` 117 GB; the output 80 GB.
+- **The screen:** removed 16,222,603 of 315,971,320 AntiRef99 sequences (5.134%). 1,472 held-out CDR3s each removed more than 1,000; the largest removed 358,021.
+- **Rows** (mean members per row): AntiRef90 152,351,629 in 153 shards (1.97); AntiRef92 161,836,404 in 162 (1.85); AntiRef94 175,083,828 in 176 (1.71); AntiRef96 199,443,463 in 200 (1.50). The test's floors are 90% of these.
 
 ## Gotchas
 
-- **Zenodo is slow to CoreWeave.** On 2026-11-10 it served CoreWeave at 5–7 KB/s per connection and the Scripps network at about 520 KB/s, while CoreWeave reached other hosts at hundreds of MB/s. The 32.5 GB download would take about two days on CoreWeave, so build on bcr.
-- **Held out by AntiRef90 cluster membership only.** No identity screen was run.
-  - A train sequence can share a held-out sequence's V gene and a similar CDR3 at under 90% identity.
-  - Because linclust is greedy and nested over six levels, a train sequence can even be 90% or more identical to a held-out representative and sit in another AntiRef90 cluster.
-  - Antibody loss on these sets flatters the model. Compare runs on the same sets; don't read absolute values.
-- Two clustering thresholds live in one dataset, against the datasets design's rule (D3), by the lab's decision for this pilot: every train option shares one set of eval and test files.
-- No screen against OPLM's uniref70 or deepclust70 either: an antibody from UniProt may sit in both.
+- **From 1.0.0:** `antiref99/train` is gone; `antiref96/train` is screened and can promote a member to representative; `antiref90/92/94/train` and the `_cdrh3` files are new; the four AntiRef90-cluster files are unchanged. Train results are not comparable across the two versions.
+- **Against the datasets design's rule (D3), by the PI's decisions:** four clustering levels live in one dataset (2026-11-12, extending 1.0.0's exception), since all four train sets must share one holdout and one screen; and the new holdout is a version of this dataset, not a new one (2026-11-13), since it is the same data curated with a different eval and test holdout.
+- **The tripwire was raised to 6%** by the PI on 2026-11-13, after the first build removed 5.134% against the planned 5%. The held-out sets were kept as drawn: public CDR3s are the ones whose holdout matters most. There is no per-CDR3 cap, which would bias the eval away from public CDR3s.
+- **Light chains are held out by AntiRef90 cluster only**, as in 1.0.0. Their CDR3s are low-diversity; light-chain loss here still rewards recall.
+- **The screen is CDR3-only.** A train sequence can share a held-out chain's V gene and framework; only its CDR3 is kept below 85%.
+- **The screen over-removes slightly, by design:** every boundary pair is tried, the whole C-terminal half is searched, light chains are screened too, and unanchored sequences get a bound looser than 85%.
+- **No screen against OPLM's uniref70 or deepclust70:** an antibody from UniProt may sit in both.
 - AntiRef's filter: OAS unpaired, human, PBMC, no disease, no vaccine. There is no donor, no nucleotide sequence, no germline call, and no SHM mask; a donor holdout needs a rebuild.
-- Light chains are low-diversity and easy for a model; read heavy-only CDR3 loss for the signal.
-- In a production decay, 3% of rows exceeds AntiRef99's 316M, so the antibodies repeat. A pilot that subsamples takes a subset of shards.
+- **Zenodo is slow to CoreWeave.** On 2026-11-10 it served CoreWeave at 5–7 KB/s per connection and the Scripps network at about 520 KB/s, so build on bcr.
+- **A flyloft job's bundle drops the executable bit:** run `python3 -I recipe/build`, not `recipe/build`.
