@@ -1,0 +1,366 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/build <out>: AFDB v4's Swiss-Prot archive as sorted, sharded parquet. Downloads EBI's
+swissprot_cif_v4.tar into <out>/.work/ -- download_streams HTTP range streams at once, each
+resumable from where its slice stopped, joining into one file -- and refuses a size that differs
+from params (EBI publishes no checksum, so every member is verified by decompressing it). It
+then scans the tar's member names and streams it again, never unpacking files to disk, extracting
+per entry the id, accession, sequence, length, global pLDDT and full CIF text, and writing
+<out>/data/00000.parquet, 00001.parquet, ...: rows sorted by id across all shards, shard_rows rows
+per shard (the last partial), zstd, row groups of row_group_rows. Rows stage in rounds of
+flush_members members: each round's rows go to per-shard chunks under <out>/.work/buckets/, and
+the shards are assembled from the chunks at the end, so a rerun resumes: it keeps the verified
+tar, the chunks of every finished round, and the shards already written. With limit > 0 only the
+first dry_bytes of the tar are downloaded and only the first limit members are read: a
+developer's dry run. Prints the download rate, the rows stage's rate, and the shard and row
+totals last.
+"""
+import gzip
+import os
+import re
+import sys
+import tarfile
+import threading
+import time
+import tomllib
+import urllib.request
+from bisect import bisect_left
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+out = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else None
+work, data = (out / ".work", out / "data") if out else (None, None)
+SCHEMA = pa.schema([
+    ("id", pa.string()),
+    ("uniprot_accession", pa.string()),
+    ("sequence", pa.string()),
+    ("length", pa.int64()),
+    ("mean_plddt", pa.float64()),
+    ("cif", pa.large_string()),
+])
+SUFFIX = "-model_v4.cif.gz"
+NAME = re.compile(r"^AF-[0-9A-Za-z]+(?:-[0-9]+)?-F\d+-model_v4\.cif\.gz$")
+LETTERS = re.compile(r"^[A-Z]+$")
+ROUND = re.compile(r"^r(\d+)\.parquet$")
+LOCAL = "_ma_qa_metric_local."
+
+
+def die(msg: str) -> None:
+    sys.exit(f"afdb-swissprot: {msg}")
+
+
+def cif_value(txt: str, tag: str) -> str:
+    """A non-loop CIF tag's value: the token on its line, or the ;-block on the lines after it."""
+    m = re.search(r"(?m)^" + re.escape(tag) + r"[ \t]*(.*)$", txt)
+    if m is None:
+        die(f"no {tag}")
+    rest = m.group(1).strip()
+    if rest:
+        if rest[0] in "'\"":
+            return rest[1:rest.find(rest[0], 1)]
+        return rest.split()[0]
+    after = txt[m.end():]
+    if not after.startswith("\n;"):
+        die(f"{tag}: neither a value on its line nor a ;-block after it")
+    end = after.find("\n;", 1)
+    if end < 0:
+        die(f"{tag}: an unterminated ;-block")
+    return "".join(after[2:end].split())
+
+
+def residue_plddts(txt: str, name: str) -> tuple[float, int]:
+    """(the mean of the _ma_qa_metric_local loop's metric_value column, its row count)."""
+    i = txt.find("\n" + LOCAL)
+    if i < 0:
+        die(f"{name}: no _ma_qa_metric_local loop")
+    end = txt.find("\n#", i)
+    if end < 0:
+        die(f"{name}: the _ma_qa_metric_local loop does not end")
+    tags, value_at, count, total = [], None, 0, 0.0
+    for line in txt[i:end].splitlines():
+        if line.startswith(LOCAL):
+            tags.append(line.strip())
+        elif line.strip():  # the segment's first line is the newline find() matched: skip blanks
+            if value_at is None:
+                try:
+                    value_at = tags.index(LOCAL + "metric_value")
+                except ValueError:
+                    die(f"{name}: the local loop has no metric_value column")
+            parts = line.split()
+            if len(parts) == len(tags):
+                total += float(parts[value_at])
+                count += 1
+    if count == 0:
+        die(f"{name}: the local loop holds no values")
+    return total / count, count
+
+
+def parse(name: str, gz: bytes) -> tuple[tuple, float, int]:
+    """((id, accession, sequence, length, mean_plddt, cif), the residue pLDDTs' mean, their count)."""
+    mid = name[: -len(SUFFIX)]
+    txt = gzip.decompress(gz).decode("utf-8")
+    if cif_value(txt, "_entry.id") != mid:
+        die(f"{name}: _entry.id is not {mid}")
+    accession = mid[3:].rsplit("-F", 1)[0]
+    plddt = float(cif_value(txt, "_ma_qa_metric_global.metric_value"))
+    if not 0.0 <= plddt <= 100.0:
+        die(f"{name}: mean pLDDT {plddt} is out of [0, 100]")
+    sequence = cif_value(txt, "_entity_poly.pdbx_seq_one_letter_code")
+    if not LETTERS.fullmatch(sequence):
+        die(f"{name}: the sequence is not one-letter codes")
+    mean, count = residue_plddts(txt, name)
+    if count != len(sequence):
+        die(f"{name}: {count} per-residue pLDDTs for a sequence of {len(sequence)}")
+    return (mid, accession, sequence, len(sequence), plddt, txt), mean, count
+
+
+def head() -> None:
+    """Refuse an archive params does not pin, before anything is downloaded."""
+    request = urllib.request.Request(params["url"], method="HEAD", headers={"User-Agent": "brineylab-datasets"})
+    with urllib.request.urlopen(request, timeout=120) as r:
+        size, modified = int(r.headers["Content-Length"]), r.headers.get("Last-Modified", "?")
+    if size != params["bytes"]:
+        die(f"{params['url']} is {size} bytes, not the {params['bytes']} params.toml pins")
+    print(f"source: {params['url']} ({size} bytes, last modified {modified})")
+
+
+def download() -> Path:
+    """The tar in .work/, fetched by download_streams parallel HTTP range streams that join into
+    one file, each resuming from where its slice stopped and given six attempts at a connection;
+    refuses a size that differs from params. With limit > 0 only the first dry_bytes are fetched."""
+    name = params["url"].rsplit("/", 1)[-1]
+    path, part = work / name, work / f"{name}.part"
+    if path.is_file():
+        for p in work.glob(f"{name}.part.*"):
+            p.unlink(missing_ok=True)
+        return path
+    total = params["dry_bytes"] if params["limit"] else params["bytes"]
+    streams = max(1, min(params["download_streams"], -(-total // (1 << 20))))
+    chunk, attempts = -(-total // streams), 6
+    fd = os.open(part, os.O_RDWR | os.O_CREAT)
+    os.ftruncate(fd, total)
+
+    def pwrite_all(buf: bytes, offset: int) -> None:
+        view, at = memoryview(buf), offset
+        while len(view):
+            n = os.pwrite(fd, view, at)
+            at += n
+            view = view[n:]
+
+    errors, lock = [], threading.Lock()
+    state = {"start": 0, "done": 0, "told": 0.0}
+    t0 = time.time()
+
+    def fetch(k: int) -> None:
+        begin, end = k * chunk, min((k + 1) * chunk, total)
+        pos_file = work / f"{name}.part.{k:04d}.pos"
+        pos = int(pos_file.read_text()) if pos_file.is_file() else begin  # absolute, as written
+        with lock:
+            state["start"] += pos - begin
+        for attempt in range(attempts):
+            if pos >= end:
+                break
+            headers = {"User-Agent": "brineylab-datasets", "Range": f"bytes={pos}-{end - 1}"}
+            try:
+                request = urllib.request.Request(params["url"], headers=headers)
+                with urllib.request.urlopen(request, timeout=120) as r:
+                    if r.status != 206:
+                        raise OSError(f"the server answered {r.status} to a range request")
+                    while pos < end:
+                        block = r.read(min(1 << 22, end - pos))
+                        if not block:
+                            raise OSError("the connection ended inside the range")
+                        pwrite_all(block, pos)
+                        pos += len(block)
+                        tmp = Path(f"{pos_file}.tmp")
+                        tmp.write_text(f"{pos}\n")
+                        os.replace(tmp, pos_file)
+                        with lock:
+                            state["done"] += len(block)
+                            now = time.time()
+                            if now - state["told"] >= 30 and state["done"] < total:
+                                state["told"] = now
+                                print(f"download: {state['done'] / 1e9:.1f} of {total / 1e9:.1f} GB "
+                                      f"({(state['done'] - state['start']) / 1e6 / max(now - t0, 1):.1f} MB/s)",
+                                      flush=True)
+                break
+            except OSError as e:
+                if attempt == attempts - 1:
+                    errors.append(f"slice {k} ({begin}-{end}): {e} at {pos}")
+                    return
+                time.sleep(30)
+        if pos != end:
+            errors.append(f"slice {k} ({begin}-{end}): stopped at {pos}, not {end}")
+
+    threads = [threading.Thread(target=fetch, args=(k,)) for k in range(streams)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    os.ftruncate(fd, total)
+    os.fsync(fd)
+    os.close(fd)
+    if errors:
+        die(f"{name}: {'; '.join(errors[:3])}")
+    if part.stat().st_size != total:
+        die(f"{name}: {part.stat().st_size} bytes is not the {total} expected")
+    os.replace(part, path)
+    for p in work.glob(f"{name}.part.*"):
+        p.unlink()
+    took = time.time() - t0
+    print(f"downloaded: {total / 1e9:.1f} GB in {took:.0f}s ({streams} streams, "
+          f"{(total - state['start']) / 1e6 / max(took, 1):.1f} MB/s of new bytes)")
+    return path
+
+
+def tar_members(path: Path, done: int, wanted: int):
+    """(index, name, the member's gz bytes) from the tar on disk, from member done to member
+    wanted, without decompressing what it skips: a resumed run does not redo them."""
+    with tarfile.open(path, "r:") as tf:
+        for i, m in enumerate(tf):
+            if i >= wanted:
+                return
+            if i < done:
+                continue
+            yield i, m.name, tf.extractfile(m).read()
+
+
+def names() -> list[str]:
+    """The entries' ids, in the tar's order, from the member names alone."""
+    ids = []
+    with tarfile.open(download(), "r:") as tf:
+        for i, m in enumerate(tf):
+            if params["limit"] and i >= params["limit"]:
+                break
+            if not NAME.fullmatch(m.name):
+                die(f"{m.name}: not an AF-<accession>-F<n>{SUFFIX} member")
+            ids.append(m.name[: -len(SUFFIX)])
+    wanted = params["limit"] or params["entries"]
+    if len(ids) != wanted:
+        die(f"the tar holds {len(ids)} entries, not the {wanted} expected")
+    if len(set(ids)) != len(ids):
+        seen, dupes = set(), set()
+        for i in ids:
+            (dupes if i in seen else seen).add(i)
+        die(f"duplicate ids in the tar: {', '.join(sorted(dupes)[:5])}")
+    return ids
+
+
+def write_progress(n: int) -> None:
+    tmp = work / "progress.tmp"
+    tmp.write_text(f"{n}\n")
+    os.replace(tmp, work / "progress.txt")
+
+
+def write_chunks(buffers: dict[int, list[tuple]], round_idx: int) -> None:
+    """One chunk file per shard that holds rows, whole or not at all: tmp then rename."""
+    for shard, rows in sorted(buffers.items()):
+        d = work / "buckets" / f"{shard:05d}"
+        d.mkdir(parents=True, exist_ok=True)
+        tmp, final = d / f"r{round_idx:06d}.tmp", d / f"r{round_idx:06d}.parquet"
+        pq.write_table(pa.table({
+            "id": [r[0] for r in rows],
+            "uniprot_accession": [r[1] for r in rows],
+            "sequence": [r[2] for r in rows],
+            "length": [r[3] for r in rows],
+            "mean_plddt": [r[4] for r in rows],
+            "cif": [r[5] for r in rows],
+        }, schema=SCHEMA), tmp, compression="zstd")
+        os.replace(tmp, final)
+
+
+def rows_stage(sorted_ids: list[str]) -> tuple[float, int]:
+    """The tar's members into per-shard chunks, in rounds of flush_members members, resuming from
+    the members progress.txt says are durable. Returns the pLDDT agreement worst case and count."""
+    flush, shard_rows = params["flush_members"], params["shard_rows"]
+    wanted = params["limit"] or len(sorted_ids)
+    if params["limit"]:  # a dry run does not resume: start every stage from nothing
+        for p in work.glob("buckets/*/*"):
+            p.unlink()
+        done = 0
+    else:
+        done = int((work / "progress.txt").read_text()) if (work / "progress.txt").is_file() else 0
+        for p in work.glob("buckets/*/*"):  # the chunks of rounds progress does not cover
+            m = ROUND.fullmatch(p.name)
+            if p.name.endswith(".tmp") or (m and int(m.group(1)) * flush >= done):
+                p.unlink()
+    buffers: dict[int, list[tuple]] = {}
+    worst, over, seen, t0 = 0.0, 0, done, time.time()
+    for i, name, gz in tar_members(download(), done, wanted):
+        row, residue_mean, _ = parse(name, gz)
+        gap = abs(row[4] - residue_mean)
+        worst, over = max(worst, gap), over + (gap > 5.0)
+        shard = bisect_left(sorted_ids, row[0]) // shard_rows
+        buffers.setdefault(shard, []).append(row)
+        seen = i + 1
+        if (i + 1) % flush == 0 or i + 1 == wanted:
+            write_chunks(buffers, i // flush)
+            write_progress(i + 1)
+            buffers.clear()
+            print(f"members: {i + 1}/{wanted} ({(i + 1 - done) / max(time.time() - t0, 1):.0f}/s)", flush=True)
+    if seen != wanted:  # pragma: no cover - the tar holds what names() counted
+        die(f"read {seen} members, not the {wanted} the names stage counted")
+    return worst, over
+
+
+def assemble(sorted_ids: list[str]) -> None:
+    """data/NNNNN.parquet from each shard's chunks: rows in id order, row groups of row_group_rows;
+    a shard that arrived out of order is sorted. Chunks are deleted once their shard is final."""
+    shard_rows, rg = params["shard_rows"], params["row_group_rows"]
+    nshards = -(-len(sorted_ids) // shard_rows)
+    data.mkdir(parents=True, exist_ok=True)
+    for shard in range(nshards):
+        final = data / f"{shard:05d}.parquet"
+        if final.is_file():
+            continue
+        bdir = work / "buckets" / f"{shard:05d}"
+        chunks = sorted(bdir.glob("r*.parquet")) if bdir.is_dir() else []
+        expected = min(shard_rows, len(sorted_ids) - shard * shard_rows)
+        if not chunks:
+            die(f"shard {shard:05d} holds no chunks")
+        ids = [i for p in chunks for i in pq.read_table(p, columns=["id"]).column("id").to_pylist()]
+        if len(ids) != expected:
+            die(f"shard {shard:05d} holds {len(ids)} rows, not {expected}")
+        part = data / f".{shard:05d}.part"
+        with pq.ParquetWriter(part, SCHEMA, compression="zstd") as w:
+            if ids == sorted(ids):
+                for p in chunks:  # one chunk in memory at a time
+                    w.write_table(pq.read_table(p), row_group_size=rg)
+            else:
+                print(f"shard {shard:05d} arrived out of id order; sorting", file=sys.stderr)
+                whole = pa.concat_tables([pq.read_table(p) for p in chunks]).sort_by("id")
+                w.write_table(whole, row_group_size=rg)
+        os.replace(part, final)
+        for p in chunks:
+            p.unlink()
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        die(f"usage: {Path(sys.argv[0]).name} <out>")
+    t0 = time.time()
+    out.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    if not params["limit"]:
+        head()
+    sorted_ids = sorted(names())
+    print(f"entries: {len(sorted_ids)} ids, sorted and unique")
+    worst, over = rows_stage(sorted_ids)
+    print(f"rows: {worst:.3f} max |mean_plddt - residue mean|, {over} entries over 5.0")
+    assemble(sorted_ids)
+    files = sorted(data.glob("*.parquet"))
+    if [p.name for p in files] != [f"{i:05d}.parquet" for i in range(len(files))]:
+        die("data/'s shards are not 00000.parquet onward without a gap")
+    total = sum(pq.ParquetFile(p).metadata.num_rows for p in files)
+    if total != len(sorted_ids):
+        die(f"data/ holds {total} rows, not {len(sorted_ids)}")
+    print(f"shards: {len(files)}")
+    print(f"rows: {total}")
+    print(f"bytes: {sum(p.stat().st_size for p in files)}")
+    print(f"took: {time.time() - t0:.0f}s")
+
+
+if __name__ == "__main__":
+    main()

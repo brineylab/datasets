@@ -1,0 +1,9 @@
+url = "https://ftp.ebi.ac.uk/pub/databases/alphafold/v4/swissprot_cif_v4.tar"
+bytes = 39471090688
+entries = 542378
+shard_rows = 15000
+row_group_rows = 2000
+flush_members = 2000
+download_streams = 16
+dry_bytes = 536870912
+limit = 0
