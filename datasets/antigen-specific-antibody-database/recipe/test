@@ -1,0 +1,54 @@
+#!/usr/bin/env -S python3 -I
+"""Check the complete Parquet release. Compare to the staged Delta snapshot during a build."""
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+import duckdb
+
+
+def validate(db, parquet, params, source=None):
+    metadata = dict(db.sql("SELECT key, value FROM parquet_kv_metadata(?)", params=[str(parquet)]).fetchall())
+    if (metadata.get(b"asd_release") != params["upstream_version"].encode()
+            or metadata.get(b"source_url") != params["source_folder"].encode()
+            or not re.fullmatch(b"[0-9a-f]{64}", metadata.get(b"source_sha256", b""))):
+        raise ValueError("missing or invalid ASD source provenance")
+    print("source SHA-256", metadata[b"source_sha256"].decode())
+    output = db.read_parquet(str(parquet), hive_partitioning=False)
+    output.create_view("exported")
+    required = {"dataset", "affinity", "affinity_type", "processed_measurement", "confidence",
+                "nanobody", "scfv", "metadata", "chains"}
+    missing = required.difference(output.columns)
+    if missing:
+        raise ValueError(f"missing ASD columns: {sorted(missing)}")
+    # Binding these paths verifies the documented nested fields, even when values are null.
+    db.sql("""SELECT chains.antibody_chains, chains.target_chains, chains.antibody_chains_numbered,
+                     metadata.target_name, metadata.target_pdb, metadata.target_uniprot,
+                     metadata.source_url, metadata.article_url FROM exported LIMIT 0""")
+    counts = db.sql("SELECT dataset, count(*) FROM exported GROUP BY dataset ORDER BY dataset").fetchall()
+    rows = sum(count for _, count in counts)
+    if rows != params["records"] or len(counts) != params["datasets"]:
+        raise ValueError(f"unexpected ASD release size: {rows} records in {len(counts)} sources")
+
+    if source is not None:
+        if source.columns != output.columns or source.types != output.types:
+            raise ValueError("exported field names or types differ from the Delta snapshot")
+        source.create_view("upstream")
+        source_counts = db.sql("SELECT dataset, count(*) FROM upstream GROUP BY dataset ORDER BY dataset").fetchall()
+        if counts != source_counts:
+            raise ValueError("exported record counts differ by source")
+        # With equal total counts, a one-way multiset difference detects any lost or changed row.
+        different = db.sql("""SELECT 1 FROM (FROM upstream EXCEPT ALL FROM exported) LIMIT 1""").fetchall()
+        if different:
+            raise ValueError("exported records differ from the Delta snapshot")
+    for dataset, count in counts:
+        print(f"{dataset} {count}")
+    print(f"{rows} records in {len(counts)} sources")
+
+
+if __name__ == "__main__":
+    out = Path(sys.argv[1])
+    params = tomllib.loads(Path(__file__).with_name("params.toml").read_text())
+    with duckdb.connect() as db:
+        validate(db, out / "asd.parquet", params)
