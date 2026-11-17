@@ -1,0 +1,78 @@
+#!/usr/bin/env -S python3 -I
+"""Import the complete logical ASD Delta table. Publish the Parquet only after exact comparison."""
+import hashlib
+import os
+import runpy
+import sys
+import tempfile
+import tomllib
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+import duckdb
+import requests
+
+recipe = Path(__file__).resolve().parent
+params = tomllib.loads((recipe / "params.toml").read_text())
+
+
+def table_root(directory):
+    logs = sorted(path for path in directory.rglob("_delta_log") if path.is_dir())
+    if len(logs) != 1:
+        raise ValueError(f"expected one Delta transaction log in {directory}, found {len(logs)}")
+    return logs[0].parent
+
+
+def source_path(work, temp):
+    if "ASD_SOURCE" in os.environ:
+        return table_root(Path(os.environ["ASD_SOURCE"]).resolve())
+    cached = work / "source"
+    if cached.exists():
+        return table_root(cached)
+    fetched = temp / "source"
+    download = runpy.run_path(str(recipe / "drive.py"))["download_folder"]
+    with requests.Session() as session:
+        download(session, params["source_folder"].rsplit("/", 1)[1], fetched)
+    archives = list(fetched.rglob("*.zip"))
+    if not list(fetched.rglob("_delta_log")) and len(archives) == 1:
+        with zipfile.ZipFile(archives[0]) as archive:
+            archive.extractall(fetched / "unpacked")
+    return table_root(fetched)
+
+
+def source_digest(root):
+    # Bind file contents to their relative paths, including the Delta transaction log.
+    snapshot = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        with path.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").digest()
+        snapshot.update(path.relative_to(root).as_posix().encode() + b"\0" + digest)
+    return snapshot.hexdigest()
+
+
+def build(out):
+    work = out / ".work"
+    work.mkdir(parents=True, exist_ok=True)
+    validate = runpy.run_path(str(recipe / "test"))["validate"]
+    with tempfile.TemporaryDirectory(dir=work) as stage, duckdb.connect() as db:
+        temp = Path(stage)
+        root = source_path(work, temp)
+        digest = source_digest(root)
+        print(f"ASD {params['upstream_version']} from {params['source_folder']}", flush=True)
+        print(f"Build UTC {datetime.now(timezone.utc).isoformat()}, source SHA-256 {digest}", flush=True)
+        db.execute("SET temp_directory = ?", [stage])
+        source = db.table_function("delta_scan", [str(root)])
+        source.create_view("upstream")
+        staged = temp / "asd.parquet"
+        db.execute("""COPY upstream TO ? (FORMAT parquet, COMPRESSION zstd,
+                   KV_METADATA {asd_release: ?, source_url: ?, source_sha256: ?})""",
+                   [str(staged), params["upstream_version"], params["source_folder"], digest])
+        validate(db, staged, params, source)
+        if (temp / "source").exists() and not (work / "source").exists():
+            (temp / "source").rename(work / "source")
+        os.replace(staged, out / "asd.parquet")
+
+
+if __name__ == "__main__":
+    build(Path(sys.argv[1]).resolve())
