@@ -1,0 +1,81 @@
+---
+dataset: antigen-specific-antibody-database
+version: 1.0.0
+hub: brineylab/antigen-specific-antibody-database
+branch: candidate-6a3a377f987368c5effae6f6adf049316d11e30a
+commit: be29ffc453d6e883342d09544415a16c0c974d1f
+tree: 6a3a377f987368c5effae6f6adf049316d11e30a
+tools: datascience@1.2.0
+runner: sbatch --partition=cpu --cpus-per-task=16 --mem=128G --time=06:00:00
+host: bcr.scripps.edu
+started: 2026-11-17T20:09:34Z
+exit: 0
+---
+pyxis: importing docker image: ghcr.io#brineylab/toolshed/datascience:1.2.0
+pyxis: imported docker image: ghcr.io#brineylab/toolshed/datascience:1.2.0
+ASD 2.0 from https://drive.google.com/drive/folders/1iSF3BZdDu2jjxIz3sSz5wjJMbPsAkPDM
+Build UTC 2026-11-17T20:17:31.852242+00:00, source SHA-256 0ec836785dcafddc5ce39cb454d14c4c1907089a01f30778cb1ccaed49917a6d
+source SHA-256 0ec836785dcafddc5ce39cb454d14c4c1907089a01f30778cb1ccaed49917a6d
+aae 35
+aatp 93
+ab-bind 283
+abbd 155853
+abdesign 672
+absci 1208
+alphaseq 198703
+biomap 2725
+buzz 524346
+covid-19 27301
+dlgo 360
+flab_hie2023 146
+flab_koenig2017 4275
+flab_rosace2023 19
+flab_shanehsazzadeh2023 448
+flab_warszawski2019 2048
+genbank 2989
+hiv 48008
+htm 385
+literature 8226
+met 4000
+osh 30
+patents 190484
+rmna 10
+scmc 754
+seha 15
+skempiv2 434
+structures-antibodies 2711
+structures-nanobodies 1258
+1177819 records in 29 sources
+source SHA-256 0ec836785dcafddc5ce39cb454d14c4c1907089a01f30778cb1ccaed49917a6d
+aae 35
+aatp 93
+ab-bind 283
+abbd 155853
+abdesign 672
+absci 1208
+alphaseq 198703
+biomap 2725
+buzz 524346
+covid-19 27301
+dlgo 360
+flab_hie2023 146
+flab_koenig2017 4275
+flab_rosace2023 19
+flab_shanehsazzadeh2023 448
+flab_warszawski2019 2048
+genbank 2989
+hiv 48008
+htm 385
+literature 8226
+met 4000
+osh 30
+patents 190484
+rmna 10
+scmc 754
+seha 15
+skempiv2 434
+structures-antibodies 2711
+structures-nanobodies 1258
+1177819 records in 29 sources
+file asd.parquet 276804954 9bfc8f96a156b002e669d2ce477f586a72e1f94e482532e6c9df6a93527f9ae2
+commit: be29ffc453d6e883342d09544415a16c0c974d1f
