@@ -91,8 +91,9 @@ for n, p in enumerate(files):
     if n + 1 < len(files) and last != params["shard_rows"]:
         problems.append(f"rows: {p.name} holds {last}, not {params['shard_rows']}")
     light = pf.read(columns=[c for c, _ in WANT if c != "cif"])
-    if light.null_count:
-        problems.append(f"nulls: {p.name} holds {light.null_count} nulls")
+    nulls = sum(col.null_count for col in light.columns)  # a Table has no null_count; its columns do
+    if nulls:
+        problems.append(f"nulls: {p.name} holds {nulls} nulls")
     shard_ids = light.column("id").to_pylist()
     ids += shard_ids
     for i, s in zip(shard_ids, light.column("uniprot_accession").to_pylist()):
