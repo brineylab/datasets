@@ -1,0 +1,177 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/test <out>: exit 0 iff <out> holds a version of afdb-swissprot. From the shards' parquet
+footers and light columns, without reading the CIFs whole: the shards are numbered without a gap,
+the schema is exactly id, uniprot_accession, sequence, length, mean_plddt and cif (string, string,
+string, int64, float64, large_string), every shard but the last is exactly shard_rows rows, the
+total is the archive's entries and never under 90% of them, every id is AF-<accession>[-<isoform>]-F<n>
+matching its uniprot_accession, the ids are sorted and unique across all shards, every length is
+len(sequence), and every mean_plddt is in [0, 100]. 16 evenly spaced rows are then read whole and
+each one's cif checked against its row: it parses with Biopython's MMCIFParser, its _entry.id is
+the id, its residues spell the sequence and number length, its _ma_qa_metric_global value is
+mean_plddt, its atoms' B-factors (the per-atom pLDDT) mean to mean_plddt within 0.01 -- v4's
+global metric is that atom-weighted mean -- and its per-residue pLDDTs' plain mean is mean_plddt
+within 5.0 (the atom weighting sits it a point or two away). One line per failure, naming the check and the
+first offending row."""
+import io
+import re
+import sys
+import tomllib
+from bisect import bisect_right
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+from Bio.PDB import MMCIFParser
+
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+ID = re.compile(r"^AF-[0-9A-Za-z]+(?:-[0-9]+)?-F\d+$")
+LOCAL = "_ma_qa_metric_local."
+WANT = [("id", pa.string()), ("uniprot_accession", pa.string()), ("sequence", pa.string()),
+        ("length", pa.int64()), ("mean_plddt", pa.float64()), ("cif", pa.large_string())]
+THREE_TO_ONE = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E",
+    "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F",
+    "PRO": "P", "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    "SEC": "U", "PYL": "O", "MSE": "M", "UNK": "X",
+}
+
+
+def local_plddts(cif: str) -> tuple[float | None, int]:
+    """(the mean of the cif's per-residue pLDDTs, their count), from its _ma_qa_metric_local loop."""
+    i = cif.find("\n" + LOCAL)
+    if i < 0:
+        return None, 0
+    end = cif.find("\n#", i)
+    if end < 0:
+        return None, 0
+    tags, at, total, count = [], None, 0.0, 0
+    for line in cif[i:end].splitlines():
+        if line.startswith(LOCAL):
+            tags.append(line.strip())
+        elif line.strip():  # the segment's first line is the newline find() matched: skip blanks
+            if at is None:
+                try:
+                    at = tags.index(LOCAL + "metric_value")
+                except ValueError:
+                    return None, 0
+            parts = line.split()
+            if len(parts) == len(tags):
+                try:
+                    total += float(parts[at])
+                except ValueError:
+                    return None, 0
+                count += 1
+    return (total / count if count else None), count
+
+
+out, problems = Path(sys.argv[1]), []
+if params["limit"]:
+    problems.append(f"limit: the published version's params.toml has limit = 0, not {params['limit']}")
+files = sorted((out / "data").glob("*.parquet")) if (out / "data").is_dir() else []
+if not files:
+    problems.append("files: data/ holds no shards")
+if [p.name for p in files] != [f"{i:05d}.parquet" for i in range(len(files))]:
+    problems.append("files: data/'s shards are not 00000.parquet onward without a gap")
+
+total, last, parsed, ids, sampled = 0, 0, 0, [], 0
+for n, p in enumerate(files):
+    try:
+        pf = pq.ParquetFile(p)
+    except Exception as e:
+        problems.append(f"parses: {p.name} is not a parquet file: {e}")
+        continue
+    got = [(f.name, f.type) for f in pf.schema_arrow]
+    if got != WANT:
+        problems.append(f"columns: {p.name} has {got}, not {WANT}")
+        continue
+    parsed += 1
+    last = pf.metadata.num_rows
+    total += last
+    if n + 1 < len(files) and last != params["shard_rows"]:
+        problems.append(f"rows: {p.name} holds {last}, not {params['shard_rows']}")
+    light = pf.read(columns=[c for c, _ in WANT if c != "cif"])
+    nulls = sum(col.null_count for col in light.columns)  # a Table has no null_count; its columns do
+    if nulls:
+        problems.append(f"nulls: {p.name} holds {nulls} nulls")
+    shard_ids = light.column("id").to_pylist()
+    ids += shard_ids
+    for i, s in zip(shard_ids, light.column("uniprot_accession").to_pylist()):
+        if not ID.fullmatch(i) or i[3:].rsplit("-F", 1)[0] != s:
+            problems.append(f"id: {p.name} holds {i!r} with uniprot_accession {s!r}, not AF-<accession>[-<isoform>]-F<n> matching it")
+            break
+    same = pc.equal(light.column("length").cast(pa.int32()), pc.utf8_length(light.column("sequence")))
+    if not pc.all(same).as_py():
+        i = same.to_pylist().index(False)
+        problems.append(f"length: {p.name} row {i} ({shard_ids[i]}) is {light.column('length')[i].as_py()}, not len(sequence) {len(light.column('sequence')[i].as_py())}")
+    ok = pc.and_(pc.greater_equal(light.column("mean_plddt"), 0.0), pc.less_equal(light.column("mean_plddt"), 100.0))
+    if not pc.all(ok).as_py():
+        i = ok.to_pylist().index(False)
+        problems.append(f"mean_plddt: {p.name} row {i} ({shard_ids[i]}) holds {light.column('mean_plddt')[i].as_py()}, not in [0, 100]")
+
+if parsed == len(files) and files and total:
+    if not 0 < last <= params["shard_rows"]:
+        problems.append(f"rows: the last shard holds {last}, not at most {params['shard_rows']} and at least 1")
+    floor = params["entries"] * 9 // 10
+    if total < floor:
+        problems.append(f"rows: the shards hold {total}, under the floor of {floor}, 90% of the archive's {params['entries']}")
+    elif total != params["entries"]:
+        problems.append(f"rows: the shards hold {total}, not the archive's {params['entries']}")
+    bad = next((k for k in range(1, len(ids)) if ids[k] <= ids[k - 1]), None)
+    if bad is not None:
+        problems.append(f"sorted: {ids[bad]} at row {bad} does not follow {ids[bad - 1]}; ids are sorted and unique across all shards")
+    by_shard = {}
+    for pos in sorted({k * total // 16 for k in range(16)}):
+        by_shard.setdefault(pos // params["shard_rows"], []).append(pos % params["shard_rows"])
+    for shard, offs in sorted(by_shard.items()):
+        pf = pq.ParquetFile(files[shard])
+        starts = [0]
+        for g in range(pf.metadata.num_row_groups):
+            starts.append(starts[-1] + pf.metadata.row_group(g).num_rows)
+        groups = {}
+        for off in offs:
+            g = bisect_right(starts, off) - 1
+            if g not in groups:
+                groups[g] = pf.read_row_group(g)
+            sampled += 1
+            row = groups[g].slice(off - starts[g], 1)
+            rid, seq = row.column("id")[0].as_py(), row.column("sequence")[0].as_py()
+            length, plddt = row.column("length")[0].as_py(), row.column("mean_plddt")[0].as_py()
+            cif = row.column("cif")[0].as_py()
+            where = f"{files[shard].name} {rid}"
+            try:
+                structure = MMCIFParser().get_structure(rid, io.StringIO(cif))
+            except Exception as e:
+                problems.append(f"cif: {where} does not parse: {e}")
+                continue
+            residues = list(structure.get_residues())
+            if len(residues) != length:
+                problems.append(f"length: {where}'s cif has {len(residues)} residues, not length {length}")
+            try:
+                spelled = "".join(THREE_TO_ONE[r.get_resname()] for r in residues)
+            except KeyError:
+                problems.append(f"sequence: {where}'s cif has a residue outside the 20 standard amino acids")
+            else:
+                if spelled != seq:
+                    problems.append(f"sequence: {where}'s residues spell a sequence the row does not")
+            b = [a.bfactor for a in structure.get_atoms()]
+            if abs(sum(b) / len(b) - plddt) > 0.01:
+                problems.append(f"mean_plddt: {where}'s atoms' B-factors mean {sum(b) / len(b):.3f}, not mean_plddt {plddt} to 0.01")
+            e = re.search(r"(?m)^_entry\.id\s+(\S+)", cif)
+            if e is None or e.group(1) != rid:
+                problems.append(f"id: {where}'s cif's _entry.id is {e.group(1) if e else 'missing'}, not {rid}")
+            m = re.search(r"(?m)^_ma_qa_metric_global\.metric_value\s+(\S+)", cif)
+            try:
+                global_ = float(m.group(1)) if m else None
+            except ValueError:
+                global_ = None
+            if global_ is None or abs(global_ - plddt) > 1e-9:
+                problems.append(f"mean_plddt: {where}'s cif's global metric is {m.group(1) if m else 'missing'}, not mean_plddt {plddt}")
+            mean, count = local_plddts(cif)
+            if mean is None or count != length or abs(mean - plddt) > 5.0:
+                problems.append(f"mean_plddt: {where}'s per-residue pLDDTs ({count}) mean {mean}, not mean_plddt {plddt} to 5.0")
+
+print(f"sampled: {sampled} rows read whole")
+print(f"data: {len(files)} shards, {total} rows")
+print("\n".join(problems) or "ok")
+sys.exit(1 if problems else 0)
