@@ -63,7 +63,7 @@ A dataset exists because a question needed it. Do not add datasets, parameters, 
 
 ## Commits and pull requests
 
-A commit message is one sentence stating the behavior. A dataset arrives as a pull request whose record is committed with it. Merge with a merge commit (`gh pr merge --merge`), then pull `main` and run `scripts/promote <name> <version>` with your own `HF_TOKEN`, in `datascience`: CI holds no Hub token.
+A commit message is one sentence stating the behavior. A dataset arrives as a pull request whose record is committed with it. Squash-merge it (`gh pr merge --squash`; merge commits stay allowed for the rare case that needs one), then pull `main` and run `scripts/promote <name> <version>` with your own `HF_TOKEN`, in `datascience`: CI holds no Hub token.
 
 <!-- codebox:board:start -->
 ## Board
