@@ -15,5 +15,19 @@ class ChangedDatasetsTests(unittest.TestCase):
         r = subprocess.run(["bash", str(repo / "scripts/changed-datasets"), "HEAD~1", "HEAD"], capture_output=True, text=True, check=True)
         self.assertEqual(r.stdout, "a\n")
 
+    def test_a_count_or_unit_only_change_is_not_a_change(self):
+        repo = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, repo)
+        (repo / "scripts").mkdir(); shutil.copy(ROOT / "scripts" / "changed-datasets", repo / "scripts")
+        skill = "---\nname: {}\nmetadata:\n  version: 1.0.0\n  license: mit\n---\nbody\n"
+        for d in ("a", "b"):
+            (repo / "datasets" / d).mkdir(parents=True); (repo / "datasets" / d / "SKILL.md").write_text(skill.format(d))
+        git(repo, "init", "-q"); git(repo, "add", "-A"); git(repo, "commit", "-qm", "1")
+        for d in ("a", "b"):
+            (repo / "datasets" / d / "SKILL.md").write_text(skill.format(d).replace("  license: mit\n", "  license: mit\n  count: 300\n  unit: pairs\n"))
+        (repo / "datasets/b/SKILL.md").write_text((repo / "datasets/b/SKILL.md").read_text() + "more prose\n")
+        git(repo, "add", "-A"); git(repo, "commit", "-qm", "2")
+        r = subprocess.run(["bash", str(repo / "scripts/changed-datasets"), "HEAD~1", "HEAD"], capture_output=True, text=True, check=True)
+        self.assertEqual(r.stdout, "b\n")
+
 if __name__ == "__main__":
     unittest.main()

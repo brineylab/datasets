@@ -161,6 +161,11 @@ def rules(dataset_dir: Path) -> list[str]:
             reasons.append(f"tools {tools!r} is not one or more toolshed tools' name@MAJOR.MINOR.PATCH separated by single spaces")
         if not meta.get("license"):
             reasons.append("license is empty")
+        if "count" in meta or "unit" in meta:  # optional, together: the catalogue's "542k structures"
+            if not meta.get("count", "").isdigit():
+                reasons.append(f"count {meta.get('count')!r} is not a whole number, digits only")
+            if not meta.get("unit"):
+                reasons.append("unit is empty; count and unit go together")
     for script in ("recipe/build", "recipe/test"):
         p = dataset_dir / script
         if not p.is_file():

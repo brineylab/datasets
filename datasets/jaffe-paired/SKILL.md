@@ -5,6 +5,8 @@ metadata:
   version: 1.0.0
   tools: datascience@1.2.0
   license: mit
+  count: 1186496
+  unit: pairs
 ---
 # jaffe-paired
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # scripts/changed-datasets <git diff range>: the datasets whose directories changed and still exist, one per line.
+# A change only to a skill's metadata.count or metadata.unit lines is not one: they describe the published
+# version, so adding or correcting them needs no new version.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-git diff --name-only "$@" -- datasets/ | cut -d/ -f2 | sort -u | while read -r d; do
+git diff --name-only -I '^  (count|unit):' "$@" -- datasets/ | cut -d/ -f2 | sort -u | while read -r d; do
   if [[ -d "datasets/$d" ]]; then echo "$d"; fi
 done

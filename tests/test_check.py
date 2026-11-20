@@ -1,5 +1,5 @@
 import unittest
-from helpers import TINY, copy_of, git
+from helpers import ROOT, TINY, copy_of, git
 import check  # noqa: E402
 ORG = check.hub_org()  # hub.toml's organization: a fork with its own is its own store
 
@@ -41,6 +41,24 @@ class CheckTests(unittest.TestCase):
         with copy_of(TINY) as d:
             (d / "recipe" / "params.toml").write_text("seed = \n")
             self.assertTrue(any(r.startswith("recipe/params.toml does not parse") for r in check.rules(d)))
+
+    def test_count_and_unit_are_optional_together_and_count_is_digits(self):
+        add = lambda d, lines: (d / "SKILL.md").write_text((d / "SKILL.md").read_text().replace("  license: mit\n", "  license: mit\n" + lines))
+        with copy_of(TINY) as d:
+            add(d, "  count: 4\n  unit: lines\n"); self.assertEqual(check.rules(d), [])
+        with copy_of(TINY) as d:
+            add(d, "  count: 1,389,546\n  unit: pairs\n")
+            self.assertEqual(check.rules(d), ["count '1,389,546' is not a whole number, digits only"])
+        with copy_of(TINY) as d:
+            add(d, "  count: 4\n"); self.assertEqual(check.rules(d), ["unit is empty; count and unit go together"])
+        with copy_of(TINY) as d:
+            add(d, "  unit: lines\n"); self.assertEqual(check.rules(d), ["count None is not a whole number, digits only"])
+
+    def test_every_dataset_in_the_repository_keeps_the_rules(self):
+        # CI's --hub check runs only on datasets whose change bumps a version; a count/unit-only edit is checked here
+        for d in sorted((ROOT / "datasets").iterdir()):
+            with self.subTest(dataset=d.name):
+                self.assertEqual(check.rules(d), [])
 
     def test_the_minimal_toml_reader_reads_the_recipes_shapes(self):
         text = 'seed = 1\nidentity = 0.9\nspecies = "human"\nlimit_on = false\nsplit = [0.8, 0.1, 0.1]  # fractions\n\n# a comment\n'

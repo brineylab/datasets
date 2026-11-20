@@ -5,6 +5,8 @@ metadata:
   version: 2.0.0
   tools: datascience@1.2.0
   license: cc-by-4.0
+  count: 299748717
+  unit: sequences
 ---
 # oplm-antibody-sequences
 
