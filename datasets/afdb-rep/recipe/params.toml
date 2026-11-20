@@ -9,4 +9,4 @@ flush_members = 2000
 fetch_workers = 64
 fetch_attempts = 8
 fetch_passes = 3
-limit = 3000
+limit = 0
