@@ -1,0 +1,12 @@
+lookup_url = "https://steineggerlab.s3.amazonaws.com/foldcomp/afdb_rep_v4.lookup"
+lookup_bytes = 96263277
+lookup_sha256 = "ee3b35f386fa8bd9c703b96e525893d5aca9f59bd5059a183049bf65cccd91c1"
+bucket = "public-datasets-deepmind-alphafold-v4"
+entries = 2278845
+shard_rows = 15000
+row_group_rows = 2000
+flush_members = 2000
+fetch_workers = 64
+fetch_attempts = 8
+fetch_passes = 3
+limit = 3000

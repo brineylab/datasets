@@ -1,0 +1,553 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/build <out>: AFDB v4's 2.28M Foldseek cluster representatives as sorted, sharded
+parquet. Downloads foldcomp's afdb_rep_v4.lookup into <out>/.work/ -- pinned by byte size and
+sha256, kept there so a rerun does not refetch it -- and takes its second column, the entry
+names, as the id list: 2,278,845 F1 models, nothing decompressed from foldcomp. Each id's
+original mmCIF then comes from the GCS bucket public-datasets-deepmind-alphafold-v4, read
+through its S3-compatible XML API with AWS Signature V4 -- region auto, service s3, signed by
+the GCS_HMAC_ACCESS_ID/GCS_HMAC_SECRET the run carries and never printed -- one request per
+object with Accept-Encoding: gzip (the objects are stored gzip-encoded; the header cuts the
+transfer about 4x) and a local gunzip. Ids are walked in sorted order, in rounds of
+flush_members ids: a round's .cif.gz files are fetched by fetch_workers persistent connections
+with retries and backoff -- a 404 at every attempt is the bucket truly lacking the object, a
+.missing marker; anything else that outlives fetch_attempts attempts is retried over
+fetch_passes passes and dies the build if it never lands -- staged under <out>/.work/cifs/ so
+a rerun resumes rather than refetches, then parsed and staged as rows to per-shard chunks
+under <out>/.work/buckets/, and every shard whose shard_rows rows are complete is assembled
+into <out>/data/NNNNN.parquet: rows sorted by id across all shards (they are fetched sorted),
+shard_rows rows per shard (the last partial), zstd, row groups of row_group_rows, before the
+round's fetched files are deleted. Ids the bucket lacks are written to <out>/.work/missing.txt
+and printed, and allowed while they stay under 0.1% of the list; past that the build stops
+rather than publish. With limit > 0 only the first limit sorted ids are built: a developer's
+dry run. Prints the fetch rate, the rows stage's rate, and the shard and row totals last.
+"""
+import datetime
+import gzip
+import hashlib
+import hmac
+import http.client
+import os
+import random
+import re
+import shutil
+import sys
+import threading
+import time
+import tomllib
+import urllib.request
+from bisect import bisect_left
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+out = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else None
+work, data = (out / ".work", out / "data") if out else (None, None)
+SCHEMA = pa.schema([
+    ("id", pa.string()),
+    ("uniprot_accession", pa.string()),
+    ("sequence", pa.string()),
+    ("length", pa.int64()),
+    ("mean_plddt", pa.float64()),
+    ("cif", pa.large_string()),
+])
+SUFFIX = "-model_v4"  # the lookup's entry names end in this; an id is the name without it
+NAME = re.compile(r"^AF-[0-9A-Za-z]+(?:-[0-9]+)?-F1-model_v4$")
+LETTERS = re.compile(r"^[A-Z]+$")
+ROUND = re.compile(r"^r(\d+)\.parquet$")
+LOCAL = "_ma_qa_metric_local."
+HOST = "storage.googleapis.com"
+EMPTY_SHA = hashlib.sha256(b"").hexdigest()
+STATE = {"missing": 0}  # the ids the bucket lacks, of this run's set
+ACCESS = SECRET = None
+
+
+def die(msg: str) -> None:
+    sys.exit(f"afdb-rep: {msg}")
+
+
+def cif_value(txt: str, tag: str) -> str:
+    """A non-loop CIF tag's value: the token on its line, or the ;-block on the lines after it."""
+    m = re.search(r"(?m)^" + re.escape(tag) + r"[ \t]*(.*)$", txt)
+    if m is None:
+        die(f"no {tag}")
+    rest = m.group(1).strip()
+    if rest:
+        if rest[0] in "'\"":
+            return rest[1:rest.find(rest[0], 1)]
+        return rest.split()[0]
+    after = txt[m.end():]
+    if not after.startswith("\n;"):
+        die(f"{tag}: neither a value on its line nor a ;-block after it")
+    end = after.find("\n;", 1)
+    if end < 0:
+        die(f"{tag}: an unterminated ;-block")
+    return "".join(after[2:end].split())
+
+
+def residue_plddts(txt: str, name: str) -> tuple[float, int]:
+    """(the mean of the _ma_qa_metric_local loop's metric_value column, its row count)."""
+    i = txt.find("\n" + LOCAL)
+    if i < 0:
+        die(f"{name}: no _ma_qa_metric_local loop")
+    end = txt.find("\n#", i)
+    if end < 0:
+        die(f"{name}: the _ma_qa_metric_local loop does not end")
+    tags, value_at, count, total = [], None, 0, 0.0
+    for line in txt[i:end].splitlines():
+        if line.startswith(LOCAL):
+            tags.append(line.strip())
+        elif line.strip():  # the segment's first line is the newline find() matched: skip blanks
+            if value_at is None:
+                try:
+                    value_at = tags.index(LOCAL + "metric_value")
+                except ValueError:
+                    die(f"{name}: the local loop has no metric_value column")
+            parts = line.split()
+            if len(parts) == len(tags):
+                total += float(parts[value_at])
+                count += 1
+    if count == 0:
+        die(f"{name}: the local loop holds no values")
+    return total / count, count
+
+
+def parse(mid: str, gz: bytes) -> tuple[tuple, float, int]:
+    """((id, accession, sequence, length, mean_plddt, cif), the residue pLDDTs' mean, their count)."""
+    txt = gzip.decompress(gz).decode("utf-8")
+    if cif_value(txt, "_entry.id") != mid:
+        die(f"{mid}: _entry.id is not {mid}")
+    accession = mid[3:].rsplit("-F", 1)[0]
+    plddt = float(cif_value(txt, "_ma_qa_metric_global.metric_value"))
+    if not 0.0 <= plddt <= 100.0:
+        die(f"{mid}: mean pLDDT {plddt} is out of [0, 100]")
+    sequence = cif_value(txt, "_entity_poly.pdbx_seq_one_letter_code")
+    if not LETTERS.fullmatch(sequence):
+        die(f"{mid}: the sequence is not one-letter codes")
+    mean, count = residue_plddts(txt, mid)
+    if count != len(sequence):
+        die(f"{mid}: {count} per-residue pLDDTs for a sequence of {len(sequence)}")
+    return (mid, accession, sequence, len(sequence), plddt, txt), mean, count
+
+
+def sign(path: str) -> tuple[str, str]:
+    """(x-amz-date, the Authorization header) for a GET of path, AWS Signature V4 with region
+    auto and service s3, signed by the run's HMAC key. The key is never returned or printed."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+    canon = "\n".join(["GET", path, "",
+                       f"host:{HOST}\nx-amz-content-sha256:{EMPTY_SHA}\nx-amz-date:{amz}\n",
+                       "host;x-amz-content-sha256;x-amz-date", EMPTY_SHA])
+    scope = f"{day}/auto/s3/aws4_request"
+    sts = "\n".join(["AWS4-HMAC-SHA256", amz, scope, hashlib.sha256(canon.encode()).hexdigest()])
+    k = ("AWS4" + SECRET).encode()
+    for part in (day, "auto", "s3", "aws4_request"):
+        k = hmac.new(k, part.encode(), hashlib.sha256).digest()
+    sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+    return amz, (f"AWS4-HMAC-SHA256 Credential={ACCESS}/{scope}, "
+                 "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+                 f"Signature={sig}")
+
+
+def head() -> None:
+    """Refuse a lookup params does not pin, before anything is fetched."""
+    request = urllib.request.Request(params["lookup_url"], method="HEAD",
+                                     headers={"User-Agent": "brineylab-datasets"})
+    with urllib.request.urlopen(request, timeout=120) as r:
+        size = int(r.headers["Content-Length"])
+        modified, etag = r.headers.get("Last-Modified", "?"), r.headers.get("ETag", "?")
+    if size != params["lookup_bytes"]:
+        die(f"{params['lookup_url']} is {size} bytes, not the {params['lookup_bytes']} params.toml pins")
+    print(f"source: {params['lookup_url']} ({size} bytes, last modified {modified}, etag {etag})")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def lookup() -> list[str]:
+    """The representatives' ids: the lookup in .work/ (downloaded unless a verified copy is
+    already there), its second column parsed and checked, then sorted."""
+    name = params["lookup_url"].rsplit("/", 1)[-1]
+    path = work / name
+    if not (path.is_file() and path.stat().st_size == params["lookup_bytes"]
+            and sha256_file(path) == params["lookup_sha256"]):
+        tmp = work / f"{name}.tmp"
+        got = 0
+        request = urllib.request.Request(params["lookup_url"],
+                                         headers={"User-Agent": "brineylab-datasets"})
+        with urllib.request.urlopen(request, timeout=300) as r, open(tmp, "wb") as f:
+            while True:
+                block = r.read(1 << 22)
+                if not block:
+                    break
+                got += len(block)
+                if got > params["lookup_bytes"]:
+                    die(f"{name}: past the {params['lookup_bytes']} bytes params.toml pins")
+                f.write(block)
+        if got != params["lookup_bytes"]:
+            die(f"downloaded {got} of {params['lookup_bytes']} bytes of {name}")
+        if sha256_file(tmp) != params["lookup_sha256"]:
+            die(f"{name}: sha256 is not the one params.toml pins, so the source was replaced")
+        os.replace(tmp, path)
+        print(f"lookup: downloaded {got} bytes and verified its sha256", flush=True)
+    else:
+        print("lookup: kept the copy in .work/, its size and sha256 already verified", flush=True)
+    names = []
+    with open(path, "rb") as f:
+        for line in f:
+            parts = line.rstrip(b"\r\n").split(b"\t")
+            if len(parts) != 3 or not NAME.fullmatch(parts[1].decode()):
+                die(f"{name}: a line whose second column is not AF-<accession>-F1-model_v4: {line[:80]!r}")
+            names.append(parts[1].decode())
+    if len(names) != params["entries"]:
+        die(f"{name} holds {len(names)} lines, not the {params['entries']} params.toml pins")
+    ids = [n[: -len(SUFFIX)] for n in names]
+    if len(set(ids)) != len(ids):
+        seen, dupes = set(), set()
+        for i in ids:
+            (dupes if i in seen else seen).add(i)
+        die(f"duplicate ids in the lookup: {', '.join(sorted(dupes)[:5])}")
+    return sorted(ids)
+
+
+def stage_paths(mid: str) -> tuple[Path, Path]:
+    """(the staged .cif.gz, the .missing marker) for an id, under .work/cifs/<3 characters>/."""
+    d = work / "cifs" / mid[3:6]
+    return d / f"{mid}.cif.gz", d / f"{mid}.missing"
+
+
+def round_names(ids: list[str]) -> set[str]:
+    """The file names already in the ids' staging directories, in one scan per directory."""
+    names = set()
+    for d in {stage_paths(m)[0].parent for m in ids}:
+        if d.is_dir():
+            with os.scandir(d) as it:
+                names.update(e.name for e in it)
+    return names
+
+
+def markers(sorted_ids: list[str], wanted: int) -> list[str]:
+    """The sorted ids the bucket lacks, of this run's first `wanted`: the .missing markers."""
+    found = []
+    for p in work.glob("cifs/*/*.missing"):
+        mid = p.name[: -len(".missing")]
+        at = bisect_left(sorted_ids, mid)
+        if at < wanted and sorted_ids[at] == mid:
+            found.append(mid)
+    return sorted(found)
+
+
+def fetch_round(ids: list[str]) -> list[str]:
+    """Stage every id's .cif.gz that is not already staged or marked, fetching in parallel with
+    fetch_workers persistent connections, fetch_attempts attempts each with backoff, over
+    fetch_passes passes. A 404 at every attempt is the bucket truly lacking the object: a
+    .missing marker and the run's missing count. Returns the ids that are staged, in order."""
+    names = round_names(ids)
+    staged = [m for m in ids if f"{m}.missing" not in names]
+    todo = [m for m in staged if f"{m}.cif.gz" not in names]
+    marked = []
+    for pas in range(params["fetch_passes"]):
+        if not todo:
+            break
+        queue, errors = list(todo), []
+        lock, nxt, stats = threading.Lock(), {"i": 0}, {"done": 0, "bytes": 0, "identity": 0, "t0": time.time()}
+
+        def worker() -> None:
+            conn = None
+            while True:
+                with lock:
+                    if nxt["i"] >= len(queue):
+                        return
+                    k, nxt["i"] = nxt["i"], nxt["i"] + 1
+                mid = queue[k]
+                err = None
+                for attempt in range(params["fetch_attempts"]):
+                    if conn is None:
+                        conn = http.client.HTTPSConnection(HOST, timeout=60)
+                    try:
+                        path = f"/{params['bucket']}/{mid}{SUFFIX}.cif"
+                        amz, auth = sign(path)
+                        conn.request("GET", path, headers={
+                            "User-Agent": "brineylab-datasets", "x-amz-date": amz,
+                            "x-amz-content-sha256": EMPTY_SHA, "Authorization": auth,
+                            "accept-encoding": "gzip"})
+                        resp = conn.getresponse()
+                        body = resp.read()
+                        if resp.status == 200:
+                            want_len = resp.getheader("Content-Length")
+                            if want_len is not None and int(want_len) != len(body):
+                                raise OSError(f"{len(body)} bytes against Content-Length {want_len}")
+                            if body[:2] == b"\x1f\x8b":
+                                pass  # stored gzip, served as asked
+                            elif body.startswith(b"data_"):
+                                body = gzip.compress(body, 1)  # served identity: gzip it here
+                                with lock:
+                                    stats["identity"] += 1
+                            else:
+                                raise OSError("neither gzip nor a CIF")
+                            gz, _ = stage_paths(mid)
+                            gz.parent.mkdir(parents=True, exist_ok=True)
+                            tmp = gz.with_name(gz.name + ".tmp")
+                            tmp.write_bytes(body)
+                            os.replace(tmp, gz)
+                            with lock:
+                                stats["done"] += 1
+                                stats["bytes"] += len(body)
+                            err = None
+                            break
+                        if resp.status == 404:
+                            err = "404"
+                        else:
+                            err = f"HTTP {resp.status}"
+                            conn.close()
+                            conn = None
+                    except Exception as e:
+                        err = type(e).__name__
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = None
+                    if attempt + 1 < params["fetch_attempts"]:
+                        time.sleep(min(64, 2 ** attempt) * random.uniform(0.5, 1.5))
+                if err is None:
+                    continue
+                if err == "404":
+                    _, mark = stage_paths(mid)
+                    mark.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = mark.with_name(mark.name + ".tmp")
+                    tmp.write_bytes(b"")
+                    os.replace(tmp, mark)
+                    with lock:
+                        marked.append(mid)
+                        STATE["missing"] += 1
+                else:
+                    with lock:
+                        errors.append((mid, err))
+
+        threads = [threading.Thread(target=worker)
+                   for _ in range(max(1, min(params["fetch_workers"], len(queue))))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        took = max(time.time() - stats["t0"], 1)
+        identity = f", {stats['identity']} identity-served" if stats["identity"] else ""
+        print(f"fetch: {len(queue) - len(errors)} of {len(queue)} staged "
+              f"({len(queue) / took:.0f}/s, {stats['bytes'] / 1e6 / took:.1f} MB/s{identity})", flush=True)
+        todo = [mid for mid, _ in errors]
+        if todo:
+            time.sleep(30 * (pas + 1))
+    if todo:
+        sample = ", ".join(f"{mid} ({err})" for mid, err in errors[:3])
+        die(f"{len(todo)} of {len(ids)} ids would not fetch ({sample})")
+    gone = set(marked)
+    return [m for m in staged if m not in gone]
+
+
+def write_progress(n: int) -> None:
+    tmp = work / "progress.tmp"
+    tmp.write_text(f"{n}\n")
+    os.replace(tmp, work / "progress.txt")
+
+
+def write_chunks(buffers: dict[int, list[tuple]], round_idx: int) -> None:
+    """One chunk file per shard that holds rows, whole or not at all: tmp then rename."""
+    for shard, rows in sorted(buffers.items()):
+        d = work / "buckets" / f"{shard:05d}"
+        d.mkdir(parents=True, exist_ok=True)
+        tmp, final = d / f"r{round_idx:06d}.tmp", d / f"r{round_idx:06d}.parquet"
+        pq.write_table(pa.table({
+            "id": [r[0] for r in rows],
+            "uniprot_accession": [r[1] for r in rows],
+            "sequence": [r[2] for r in rows],
+            "length": [r[3] for r in rows],
+            "mean_plddt": [r[4] for r in rows],
+            "cif": [r[5] for r in rows],
+        }, schema=SCHEMA), tmp, compression="zstd")
+        os.replace(tmp, final)
+
+
+def assemble_shard(shard: int, expected: int) -> None:
+    """data/NNNNN.parquet from the shard's chunks: rows in id order, row groups of
+    row_group_rows; a shard that arrived out of order is sorted (ids are fetched sorted, so
+    this is a guard, not the path). Chunks are deleted once their shard is final."""
+    final = data / f"{shard:05d}.parquet"
+    if final.is_file():
+        if pq.ParquetFile(final).metadata.num_rows == expected:
+            for p in (work / "buckets" / f"{shard:05d}").glob("r*.parquet"):
+                p.unlink()
+            return
+        final.unlink()  # a smaller run's partial shard, or the wrong count: rebuild it
+    bdir = work / "buckets" / f"{shard:05d}"
+    chunks = sorted(bdir.glob("r*.parquet")) if bdir.is_dir() else []
+    if not chunks:
+        die(f"shard {shard:05d} holds no chunks")
+    ids = [i for p in chunks for i in pq.read_table(p, columns=["id"]).column("id").to_pylist()]
+    if len(ids) != expected:
+        die(f"shard {shard:05d} holds {len(ids)} rows, not {expected}")
+    data.mkdir(parents=True, exist_ok=True)
+    part = data / f".{shard:05d}.part"
+    with pq.ParquetWriter(part, SCHEMA, compression="zstd") as w:
+        if ids == sorted(ids):
+            for p in chunks:  # one chunk in memory at a time
+                w.write_table(pq.read_table(p), row_group_size=params["row_group_rows"])
+        else:
+            print(f"shard {shard:05d} arrived out of id order; sorting", file=sys.stderr)
+            whole = pa.concat_tables([pq.read_table(p) for p in chunks]).sort_by("id")
+            w.write_table(whole, row_group_size=params["row_group_rows"])
+    os.replace(part, final)
+    for p in chunks:
+        p.unlink()
+
+
+def unlink_all(paths) -> None:
+    """Delete paths with a few threads: a round's worth of small files, off the parse thread."""
+    paths = list(paths)
+    if not paths:
+        return
+
+    def part(k: int) -> None:
+        for p in paths[k::8]:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+    threads = [threading.Thread(target=part, args=(k,)) for k in range(min(8, len(paths)))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def rows_stage(sorted_ids: list[str]) -> tuple[float, int, list[str]]:
+    """The rounds: fetch each round's ids, stage their rows to per-shard chunks, advance
+    progress.txt, assemble every shard whose rows complete, delete the round's fetched files --
+    so a rerun resumes from the last durable round. Returns the pLDDT agreement worst case and
+    count, and the ids the bucket lacks."""
+    flush, shard_rows = params["flush_members"], params["shard_rows"]
+    wanted = params["limit"] or len(sorted_ids)
+    if params["limit"]:  # a dry run does not resume: start every stage from nothing
+        (work / "progress.txt").unlink(missing_ok=True)
+        for p in work.glob("buckets/*/*"):
+            p.unlink()
+        for p in data.glob("*.parquet"):
+            p.unlink()
+        done = 0
+    else:
+        members = int((work / "progress.txt").read_text()) if (work / "progress.txt").is_file() else 0
+        done = wanted if members >= wanted else members - members % flush
+        for p in work.glob("buckets/*/*"):  # the chunks of rounds progress does not cover
+            m = ROUND.fullmatch(p.name)
+            end = min((int(m.group(1)) + 1) * flush, wanted) if m else None
+            if p.name.endswith(".tmp") or (m and end > done):
+                p.unlink()
+    # what is durably staged: the shards that hold shard_rows rows (and, from a completed run
+    # of this size, its last), plus the durable chunks -- both counted from footers alone
+    present, assembled = 0, 0
+    for p in sorted(data.glob("*.parquet")):
+        n, k = pq.ParquetFile(p).metadata.num_rows, int(p.stem)
+        if k != assembled:
+            die(f"data/ holds {p.name} after {assembled:05d}: the shards are not in order")
+        if n == shard_rows or (done >= wanted and n > 0):
+            assembled, present = k + 1, present + n
+        else:  # a smaller run's partial last shard, or a stale shard of the wrong count
+            p.unlink()
+    for p in work.glob("buckets/*/r*.parquet"):
+        if int(p.parent.name) < assembled:  # its shard is final: a leftover of the rename window
+            p.unlink()
+            continue
+        present += pq.ParquetFile(p).metadata.num_rows
+    STATE["missing"] = len(markers(sorted_ids, wanted))
+    buffers, worst, over, t0 = {}, 0.0, 0, time.time()
+    rounds = -(-wanted // flush)
+    for r in range(done // flush if done < wanted else rounds, rounds):
+        ids = sorted_ids[r * flush: min((r + 1) * flush, wanted)]
+        ok = fetch_round(ids)
+        if STATE["missing"] > params["entries"] // 1000:
+            die(f"the bucket lacks {STATE['missing']} of the {params['entries']} ids, over the "
+                f"0.1% allowed: stopping rather than publish")
+        for mid in ok:
+            row, residue_mean, _ = parse(mid, stage_paths(mid)[0].read_bytes())
+            gap = abs(row[4] - residue_mean)
+            worst, over = max(worst, gap), over + (gap > 5.0)
+            buffers.setdefault(present // shard_rows, []).append(row)
+            present += 1
+        write_chunks(buffers, r)
+        write_progress(min((r + 1) * flush, wanted))
+        buffers.clear()
+        while (assembled + 1) * shard_rows <= present:
+            assemble_shard(assembled, shard_rows)
+            assembled += 1
+        unlink_all(stage_paths(m)[0] for m in ok)
+        n = min((r + 1) * flush, wanted)
+        print(f"members: {n}/{wanted} ({(n - done) / max(time.time() - t0, 1):.0f}/s, "
+              f"{STATE['missing']} missing)", flush=True)
+    missing = markers(sorted_ids, wanted)
+    if present != wanted - len(missing):
+        die(f"staged {present} rows for {wanted - len(missing)} expected "
+            f"({len(missing)} of the ids missing)")
+    nshards = -(-present // shard_rows)
+    for k in range(nshards):
+        assemble_shard(k, min(shard_rows, present - k * shard_rows))
+    (work / "missing.txt").write_text("".join(m + "\n" for m in missing))
+    return worst, over, missing
+
+
+def cleanup() -> None:
+    """The fetched .cif.gz files are spent -- every round deletes its own as it goes, so only
+    the markers are left -- and with every shard final the staging goes. A dry run keeps what
+    it fetched: the full cook reuses it, its ids a prefix of the sorted list."""
+    if params["limit"]:
+        return
+    for d in ("cifs", "buckets"):
+        p = work / d
+        if p.is_dir():
+            shutil.rmtree(p)
+
+
+def main() -> None:
+    global ACCESS, SECRET
+    if len(sys.argv) != 2:
+        die(f"usage: {Path(sys.argv[0]).name} <out>")
+    t0 = time.time()
+    out.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    ACCESS, SECRET = os.environ.get("GCS_HMAC_ACCESS_ID"), os.environ.get("GCS_HMAC_SECRET")
+    if not (ACCESS and SECRET):
+        die("GCS_HMAC_ACCESS_ID/GCS_HMAC_SECRET are not set: recooking needs a Google Cloud HMAC key")
+    if not params["limit"]:
+        head()
+    sorted_ids = lookup()
+    print(f"entries: {len(sorted_ids)} ids, sorted and unique"
+          + (f" (limit {params['limit']})" if params["limit"] else ""), flush=True)
+    worst, over, missing = rows_stage(sorted_ids)
+    print(f"rows: {worst:.3f} max |mean_plddt - residue mean|, {over} entries over 5.0")
+    if missing:
+        print(f"missing: {len(missing)} ids the bucket lacks, in {work / 'missing.txt'}:")
+        print("".join("  " + m + "\n" for m in missing), end="")
+    else:
+        print("missing: none")
+    files = sorted(data.glob("*.parquet"))
+    if [p.name for p in files] != [f"{i:05d}.parquet" for i in range(len(files))]:
+        die("data/'s shards are not 00000.parquet onward without a gap")
+    total = sum(pq.ParquetFile(p).metadata.num_rows for p in files)
+    wanted = params["limit"] or len(sorted_ids)
+    if total != wanted - len(missing):
+        die(f"data/ holds {total} rows, not the {wanted - len(missing)} expected")
+    cleanup()
+    print(f"shards: {len(files)}")
+    print(f"rows: {total}")
+    print(f"bytes: {sum(p.stat().st_size for p in files)}")
+    print(f"took: {time.time() - t0:.0f}s")
+
+
+if __name__ == "__main__":
+    main()
