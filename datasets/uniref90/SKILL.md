@@ -5,6 +5,8 @@ metadata:
   version: 1.0.0
   tools: datascience@1.2.0
   license: cc-by-4.0
+  count: 125724408
+  unit: sequences
 ---
 # uniref90
 

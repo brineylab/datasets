@@ -23,7 +23,7 @@ The record, `results/<name>/<version>.txt`, is written by `scripts/record` after
 
 ## The skill
 
-Frontmatter has five fields a machine reads:
+Frontmatter has five fields a machine reads, and two optional ones:
 
 ```markdown
 ---
@@ -33,10 +33,12 @@ metadata:
   version: 1.0.0
   tools: datascience@1.0.0
   license: <the Hub's license id, e.g. mit or cc-by-4.0>
+  count: <how many entries the version holds, digits only, e.g. 542378>
+  unit: <what an entry is: sequences, pairs, structures, ...>
 ---
 ```
 
-`name` is the directory's and the Hub repository's, `description` is the catalogue line, `metadata.version` is the Hub tag (`v` prefixed), `metadata.tools` is one or more `name@version` separated by single spaces (a string: the skill format's `metadata` maps strings to strings), and `metadata.license` goes on the card. Then the body, in this order: `Hub:` (the repository and tag), `## Files` (each file, its rows, its columns), `## Reading it` (the `snapshot_download` line at this version), `## Recipe` (the source, its pull date, every parameter, the tools, what the test checks), `## Compute` (CPUs, memory, hours, disk, measured), `## Gotchas`. The body is also the Hub's card. No declared schemas: prose.
+`name` is the directory's and the Hub repository's, `description` is the catalogue line, `metadata.version` is the Hub tag (`v` prefixed), `metadata.tools` is one or more `name@version` separated by single spaces (a string: the skill format's `metadata` maps strings to strings), and `metadata.license` goes on the card. `metadata.count` and `metadata.unit`, optional and together, are the catalogue's size line (flyloft's board shows "542k structures"): `count` is the version's whole number of entries in digits, no commas, across every file, and `unit` is what one entry is. Write them when you record a version; a version without them still works. Then the body, in this order: `Hub:` (the repository and tag), `## Files` (each file, its rows, its columns), `## Reading it` (the `snapshot_download` line at this version), `## Recipe` (the source, its pull date, every parameter, the tools, what the test checks), `## Compute` (CPUs, memory, hours, disk, measured), `## Gotchas`. The body is also the Hub's card. No declared schemas: prose.
 
 ## The recipe's shape
 
@@ -96,7 +98,7 @@ A change after cooking changes the tree, so cook, push, and record again. A pros
 
 ## Versions
 
-Any change under `datasets/<name>/` bumps `metadata.version`, prose included. A published tag is never moved, and `check` refuses a pull request whose tag is already on the Hub. Readers always name a version, never `main`, which is a copy of the version last promoted, for the Hub's page.
+Any change under `datasets/<name>/` bumps `metadata.version`, prose included, except adding or correcting `metadata.count` and `metadata.unit`: they describe the published version, so CI does not count that as a change. A published tag is never moved, and `check` refuses a pull request whose tag is already on the Hub. Readers always name a version, never `main`, which is a copy of the version last promoted, for the Hub's page.
 
 ## The pull request
 

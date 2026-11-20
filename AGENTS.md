@@ -45,8 +45,8 @@ datasets/<name>/recipe/build <out> && datasets/<name>/recipe/test <out> && pytho
 - **The recipe's tools are toolshed tools**, named in the skill's `metadata.tools` as one or more `name@version` separated by single spaces; the one that pushes is built without `HF_HUB_OFFLINE` and holds `huggingface_hub` and python3 (the shed's `datascience`). A recipe never pip-installs.
 - **The identity is the recipe's inputs.** The skill states the source, its pull date, every parameter, and the tools' versions in prose; the record carries them. A change to any of them is a new version; a change that makes the result incomparable (a threshold, a species) is a new dataset.
 - **Variants are datasets, versions are time.** Copy the sibling's directory, change what differs, give it its own name.
-- **Any change under `datasets/<name>/` bumps `metadata.version`**, prose included. A published tag is never moved; readers always name a version.
-- **The skill's frontmatter is `name`, `description`, `metadata.version`, `metadata.tools`, `metadata.license`.** Everything else is prose. No declared schemas.
+- **Any change under `datasets/<name>/` bumps `metadata.version`**, prose included, except `metadata.count`/`metadata.unit` alone (`scripts/changed-datasets` ignores them). A published tag is never moved; readers always name a version.
+- **The skill's frontmatter is `name`, `description`, `metadata.version`, `metadata.tools`, `metadata.license`, and optionally `metadata.count` (digits) with `metadata.unit`.** Everything else is prose. No declared schemas.
 - **The test judges the real output**, in seconds, from footers and samples: the files, the schema, row counts above the recipe's floor, the recipe's own checks. It is not the recipe on a slice.
 - **Never a credential in the repository**: `scripts/push` reads `HF_TOKEN` and never prints it; `scripts/push`, `scripts/record`, and `check` refuse what looks like one.
 

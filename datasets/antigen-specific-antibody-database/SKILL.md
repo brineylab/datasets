@@ -5,6 +5,8 @@ metadata:
   version: 1.0.1
   tools: datascience@1.2.0
   license: cc-by-nc-4.0
+  count: 1177819
+  unit: records
 ---
 # Antigen Specific Antibody Database
 
