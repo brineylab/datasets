@@ -1,0 +1,134 @@
+---
+dataset: uniref50-afdb-holdout-filtered
+version: 1.0.0
+hub: brineylab/uniref50-afdb-holdout-filtered
+branch: candidate-eb63f7cff1342ca8e01264b5141abe0822b0a412
+commit: 17f1c9024973606d74f8df250db0543e9cee26c7
+tree: eb63f7cff1342ca8e01264b5141abe0822b0a412
+tools: datascience@1.2.0
+runner: sbatch --partition=flyloft --cpus-per-task=16 --mem=64G --time=04:00:00
+host: sunk.6af0ac-eu-south-03b-briney-b200.coreweave.app
+started: 2026-11-21T14:25:14Z
+exit: 0
+---
+Job 2041: SUNK job dashboard: https://cks-grafana.coreweave.com/d/slurm-job-metrics/slurm-job-metrics?var-slurm_cluster=slurm&var-job_id=2041
+pyxis: importing docker image: ghcr.io#brineylab/toolshed/datascience:1.2.0
+pyxis: imported docker image: ghcr.io#brineylab/toolshed/datascience:1.2.0
+== sources: pulling uniref50@v1.0.0 and afdb-rep-stok-large@v1.0.1
+Fetching 44 files:   0%|          | 0/44 [00:00<?, ?it/s]Fetching 44 files: 100%|██████████| 44/44 [00:00<00:00, 2228.18it/s]
+Fetching 2 files:   0%|          | 0/2 [00:00<?, ?it/s]Fetching 2 files: 100%|██████████| 2/2 [00:00<00:00, 419.07it/s]
+== holdout: writing the validation and test sequences
+{
+  "name": "uniref50-afdb-holdout-filtered",
+  "version_params": {
+    "uniref50_repository": "brineylab/uniref50",
+    "uniref50_revision": "v1.0.0",
+    "holdout_repository": "brineylab/afdb-rep-stok-large",
+    "holdout_revision": "v1.0.1",
+    "min_seq_id": 0.5,
+    "coverage": 0.8,
+    "cov_mode": 0,
+    "sensitivity": 7.5,
+    "evalue": 100.0,
+    "max_seqs": 2000,
+    "shard_rows": 1000000,
+    "row_group_rows": 100000,
+    "limit": 0
+  },
+  "sources": {
+    "uniref50": {
+      "repository": "brineylab/uniref50",
+      "revision": "v1.0.0",
+      "path": "/mnt/data/flyloft/briney/afdb-rep-structure-tokens/afdb-rep-structure-tokens-2f2cbf3a/datasets/uniref50-afdb-holdout-filtered/.work/hf-cache/datasets--brineylab--uniref50/snapshots/6e0c895ffb7ce90066bd6ff37bbd2e5bd541c45b",
+      "data": "/mnt/data/flyloft/briney/afdb-rep-structure-tokens/afdb-rep-structure-tokens-2f2cbf3a/datasets/uniref50-afdb-holdout-filtered/.work/hf-cache/datasets--brineylab--uniref50/snapshots/6e0c895ffb7ce90066bd6ff37bbd2e5bd541c45b/data",
+      "shards": 42,
+      "rows": 41243524
+    },
+    "holdout": {
+      "repository": "brineylab/afdb-rep-stok-large",
+      "revision": "v1.0.1",
+      "splits": {
+        "validation": {
+          "path": "/mnt/data/flyloft/briney/afdb-rep-structure-tokens/afdb-rep-structure-tokens-2f2cbf3a/datasets/uniref50-afdb-holdout-filtered/.work/hf-cache/datasets--brineylab--afdb-rep-stok-large/snapshots/e710e5979f68afc674c87799d39bf4347fd8ce20/validation",
+          "shards": 1,
+          "rows": 11495
+        },
+        "test": {
+          "path": "/mnt/data/flyloft/briney/afdb-rep-structure-tokens/afdb-rep-structure-tokens-2f2cbf3a/datasets/uniref50-afdb-holdout-filtered/.work/hf-cache/datasets--brineylab--afdb-rep-stok-large/snapshots/e710e5979f68afc674c87799d39bf4347fd8ce20/test",
+          "shards": 1,
+          "rows": 11264
+        }
+      },
+      "rows": 22759
+    },
+    "pulled": "2026-11-21T14:25:39+00:00",
+    "seconds": 0.6
+  },
+  "holdout": {
+    "sequences": 22759,
+    "fasta": "/mnt/data/flyloft/briney/afdb-rep-structure-tokens/afdb-rep-structure-tokens-2f2cbf3a/datasets/uniref50-afdb-holdout-filtered/d8537b0f/.work/holdout.fasta",
+    "sha256": "d4f98de2055186ab12399f0feead4ee7a240c31365d9b7a316a196acdcde0fa8"
+  },
+  "mmseqs": {
+    "removed": 26523,
+    "resumed": true
+  },
+  "write": {
+    "shards": 42,
+    "rows": 41217001,
+    "removed_sampled": 8
+  },
+  "verify": {
+    "shards": 42,
+    "rows": 41217001
+  }
+}
+uniref50-afdb-holdout-filtered: 41217001 rows of 41243524 (26523 removed as holdout homologs)
+ok: 42 shards, 41217001 rows, schemas, sampled rows whole
+ok: the output is uniref50 minus 26523 removed ids, in the source's order
+ok: every sampled removed id re-hits a holdout protein (8 re-searched)
+ok: 41217001 rows + 26523 removed == uniref50's 41243524
+file data/00000.parquet 973527550 f267da925decab1b61d79645473791a3ed7773d36c7ca90c12dd6073f384546a
+file data/00001.parquet 543012305 b1aa1f440606807fdee35d19563dbee5f62c4ddba5f81f8184eb0a217c70f8e3
+file data/00002.parquet 435398026 42371d8821f5443fed0a5a9b4c314000b6d6c5a9b0890797d03c1a94be8cc976
+file data/00003.parquet 372914917 b72a0701284b7e4f15570eb44f9d2a0ba8000ed0c813c848898a7328bd8d2c99
+file data/00004.parquet 329525412 876bfc331cf28a9423bc45d3299cd1b881e4e2efe58a0c5988c09d04338c1df2
+file data/00005.parquet 298028031 30fe3ddbded244da01c4283511f392b2741b24484a45cef1a609a6679210e46b
+file data/00006.parquet 272781209 638056aaa1e01f28b8c83e824f189872562496df02e721677c08ab3733cdc464
+file data/00007.parquet 251922371 22b46fde8066ff9d5f833a1aa52d179dc0820295f9a8e1f2ef095d0aa45b0788
+file data/00008.parquet 234485456 813f84df46775aa9cfeeb4edf2aa144e3fabe2d1a3dee7a03d046821e1425331
+file data/00009.parquet 219504556 3ccd6c382470bd3639c8bb362b7bd7fabf6edf6ae291e517c2cbd6fa17697d6f
+file data/00010.parquet 206417694 9841bd85bd78e3e2e984e362863502560a4b4cbeeb732f60cc03ae2ebeee7800
+file data/00011.parquet 194181564 b3a07b55007d3b0bd051ebb4f3e77c1ed564181d0d78695aa7ec307ebbbe6c82
+file data/00012.parquet 183000420 05655f7452df6b2a279457c9b1951476f53c3b790605f57c3cb2c1b7dbb1d670
+file data/00013.parquet 173514660 25b52cf9f9430e73c687e19e3fac2775fc233651b31be693ee6ef69c86c61a38
+file data/00014.parquet 164445436 eaea4f93e88f7bcd93b3d7c62f557bc6998a7cc3634316be2a3baf666a0a6a61
+file data/00015.parquet 155759660 dee9a3fca034eb508dc38f11fad92e0909326dd80a69541fe0a0c2bf7e828ee6
+file data/00016.parquet 147554601 81fa91352d34ec8618e3bbb42319e45652b3253b929c88cbb85888a34cc8f853
+file data/00017.parquet 139595331 a24c2aecfbb092d38302c14bf4503e1e89bb2e419b7d18a1d8fe4cd030e08359
+file data/00018.parquet 132337305 91f4fa95b7c9d4beba7e29f16c3028ef0232d021ad3ffa131129d8033b8a2276
+file data/00019.parquet 125487447 1b0c85cf1688692115fe5c85f42107a8c1aec657d263acf3518ac565df4c21f9
+file data/00020.parquet 118997077 b186b4d27e5b852f8c899bffb0b8d7be9a5b4662e4588f8d97afbb7b2ac50b7f
+file data/00021.parquet 112964214 a8a54d2cfcc99dcb727574c2f9062649ca09697cbfa17b37cc2c63dc140ba18d
+file data/00022.parquet 107165673 2cb44fab11ee707d6c9cbd5b23a151edb97d19d6bec18edb3abdcaca79d140b5
+file data/00023.parquet 101622054 11b19f29bc5b5ea07bd86c4ed83a3e82b5bcf31241b5568b4992868f720a7483
+file data/00024.parquet 96535252 a92e602c6755ed4acd08b9b6346669c6064599aa3abe0660025810d2ccfac1fd
+file data/00025.parquet 91618080 743b8ffa0b0d5b2324375ff99da232e164146c93920d9ac2eab2511baa8f9761
+file data/00026.parquet 87053433 9868ac21130f0bcf1cb3798a538413bd3bb5e8114acd12d2944f5977723e72b5
+file data/00027.parquet 82669258 aeb8a0a0c10f81c5749728d94fd394b3c2d6ad75b8a508c85932829cd5ddf5a2
+file data/00028.parquet 78306774 33f3e64ce83690313ab4f3c81e49179479bf9a3b4572aa3189c99bd31b9dbee1
+file data/00029.parquet 73794009 5db57bd0c68be61b16a4dbe95511f56aa4c3b87251e50fef5744aefcb50aaf2e
+file data/00030.parquet 69723057 6363c8bd3a732646bc99465512b77bf0eb4fd2cf134b32305d70a95d6ce24027
+file data/00031.parquet 65952927 73d27d11df057f0ec18d4fbd38d02ec1d6687099e1fb8038904d387465233a9c
+file data/00032.parquet 62354594 aed899f14087397e76f394863ebd54109efd8904dc8c3fd4e3f1b9db53ca147e
+file data/00033.parquet 58745037 b05dbcb4d94bb5110a012be2a598bc3d0f1382679a30448c8dbbb3dc21909e90
+file data/00034.parquet 55101600 6ddbd1ff7f579b9b147dc8cd0b2bc7f0beb74e02ede7b1cc2fb147e53928a4ee
+file data/00035.parquet 51487867 dc45116c11f899956d628e2fe716a8fe01b08c4ae9cf613cf4b5b075a9b4c0f3
+file data/00036.parquet 48117344 905b3d92cf36d120c746be5e7f0672a97de5c6d0ba6f793aac3eaacb9407823f
+file data/00037.parquet 44841723 32dd6b1fbb5655441d0684a8b66c36be724a9feae0885e664b62c084a1e0dd8f
+file data/00038.parquet 41463414 b92c8d79ebc6498a3416a1e7a031117a120d23cee48547b5a3570085a540152e
+file data/00039.parquet 37173353 0cb4e61f15351de240a19ffd370076b3123b9d41b185df0fcaddf1d8b31c91e3
+file data/00040.parquet 30679363 8748132944109612205239a5ce1b34520c843eb78b571205b812a19a0e75277b
+file data/00041.parquet 4856852 fef6b9eb7f83c858ecf77892bd31b1faa7542cc792d2fed5eeb397a0414ffbb4
+commit: 17f1c9024973606d74f8df250db0543e9cee26c7
+Job 2041: SUNK job dashboard: https://cks-grafana.coreweave.com/d/slurm-job-metrics/slurm-job-metrics?var-slurm_cluster=slurm&var-job_id=2041
