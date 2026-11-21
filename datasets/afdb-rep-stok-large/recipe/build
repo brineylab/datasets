@@ -32,12 +32,18 @@ finished, so a cook -- and a campaign that staged the GPU step's output under
           build stops.  train/ drops the coordinates column; validation/ and
           test/ keep it.  15000-row zstd shards, row groups of 2000, the
           stok.tokenizer metadata preserved, rows in the tokens' order (sorted
-          by sequence_id).  rejected/ carries the tokenize step's rejection
-          records, one jsonl per shard that had any.  <out>/.work/split-done.json
+          by sequence_id).  The tokenize step's rejection records publish as one
+          Parquet file, <out>/rejected.parquet -- sequence_id, reason, rows
+          sorted by id: Parquet is the repository's shape for tabular data,
+          and the Hub keeps a Parquet file's bytes in LFS, where a jsonl
+          this small would sit in git itself, against the rule that the
+          bytes are on the Hub, never in git.
+          <out>/.work/split-done.json
           marks the stage; a partial or stale split is wiped and redone from
           the tokens, so the stage starts over cleanly rather than resuming.
   verify  the output read back from its footers: shards numbered without
-          gaps, schemas exact, row counts, split sizes, token rows +
+          gaps, schemas exact, row counts, split sizes, rejected.parquet's
+          schema and rows, token rows +
           rejected rows == every source row.
 
 With limit > 0 only the first limit token shards feed the split: a
@@ -65,6 +71,7 @@ IDENTITY = ("preset", "checkpoint_sha256", "codebook_sha256", "codebook_size")
 SPLITS = ("train", "validation", "test")
 TRAIN_COLUMNS = ("sequence_id", "sequence", "structure_tokens", "mean_plddt",
                 "uniprot_accession")
+REJECTIONS = pa.schema([("sequence_id", pa.string()), ("reason", pa.string())])
 
 
 def die(message: str) -> None:
@@ -190,7 +197,7 @@ def token_state(out: Path, wanted_shards: int) -> dict:
                     die(f"{shard}: tokenizer {field} is {current.get(field)!r}, "
                         f"the first shard says {identity.get(field)!r}")
         rows += footer.metadata.num_rows
-    rejected = tally_rejections(tokens, wanted_shards)
+    rejected = tally(staged_rejections(tokens, wanted_shards))
     if rows + rejected["total"] != expected:
         die(f"{tokens}: {rows} token rows + {rejected['total']} rejected is "
             f"not the {expected} rows of the source's first "
@@ -199,31 +206,42 @@ def token_state(out: Path, wanted_shards: int) -> dict:
             "rejected": rejected}
 
 
-def tally_rejections(tokens: Path, wanted: int = 0) -> dict:
-    """Every rejection record, by reason; the first `wanted` shards only.
+def staged_rejections(tokens: Path, wanted: int = 0) -> list[tuple[str, str]]:
+    """Every staged rejection record, the first `wanted` shards only.
 
-    `tokens` is the directory holding rejected/ (the tokens' root for the
-    staged set, the output's root for the copied set): the rejected
-    directory is appended here, never by the caller.
+    The tokenize step stages them as jsonl, one file per token shard
+    (rejected/00000.jsonl, ...); this reads them back as (sequence_id,
+    reason) tuples, sorted by id.
     """
-    total, reasons = 0, {}
     directory = tokens / "rejected"
     paths = sorted(directory.glob("*.jsonl")) if directory.is_dir() else []
     if wanted:
         paths = [path for path in paths if int(path.stem) < wanted]
+    records: list[tuple[str, str]] = []
     for path in paths:
         for line in path.read_text().splitlines():
             if not line.strip():
                 continue
             entry = json.loads(line)
-            total += 1
-            reasons[entry["reason"]] = reasons.get(entry["reason"], 0) + 1
-    return {"total": total, "by_reason": dict(sorted(reasons.items()))}
+            records.append((entry["sequence_id"], entry["reason"]))
+    records.sort()
+    return records
+
+
+def tally(records: list[tuple[str, str]]) -> dict:
+    """Rejection records counted, by reason."""
+    reasons: dict[str, int] = {}
+    for _, reason in records:
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return {"total": len(records), "by_reason": dict(sorted(reasons.items()))}
 
 
 def wipe_partial(out: Path) -> None:
+    # "rejected" is the pre-1.0.1 directory of copied jsonl files; a
+    # rerun in the parquet format wipes it along with everything else.
     for name in (*SPLITS, "rejected"):
         shutil.rmtree(out / name, ignore_errors=True)
+    (out / "rejected.parquet").unlink(missing_ok=True)
 
 
 def run_split(out: Path, tokens: Path, wanted_shards: int) -> dict:
@@ -234,10 +252,12 @@ def run_split(out: Path, tokens: Path, wanted_shards: int) -> dict:
     expected = {"shards": len(shards)}
     if marker.is_file():
         done = json.loads(marker.read_text())
-        if done.get("tokens_shards") == len(shards):
+        if (done.get("tokens_shards") == len(shards)
+                and done.get("rejected_format") == "parquet"):
             return done
         print(f"== split: marker names {done.get('tokens_shards')} token "
-              f"shards, now {len(shards)}; redoing the split", flush=True)
+              f"shards (rejections as {done.get('rejected_format')}), now "
+              f"{len(shards)} shards; redoing the split", flush=True)
     wipe_partial(out)
     print(f"== split: {len(shards)} token shards -> train/validation/test",
           flush=True)
@@ -283,7 +303,7 @@ def run_split(out: Path, tokens: Path, wanted_shards: int) -> dict:
     counts = {split: sum(pq.ParquetFile(path).metadata.num_rows
                          for path in sorted((out / split).glob("*.parquet")))
               for split in SPLITS}
-    rejected = copy_rejections(out, tokens)
+    rejected = copy_rejections(out, tokens, wanted_shards)
     total = sum(counts.values())
     tolerance = params["split_tolerance"]
     for split in ("validation", "test"):
@@ -296,7 +316,8 @@ def run_split(out: Path, tokens: Path, wanted_shards: int) -> dict:
         "tokens_shards": len(shards), "rows": counts, "total": total,
         "shards": {split: len(sorted((out / split).glob("*.parquet")))
                    for split in SPLITS},
-        "rejected": rejected, "identity": json.loads(metadata[TOKENIZER_KEY]),
+        "rejected": rejected, "rejected_format": "parquet",
+        "identity": json.loads(metadata[TOKENIZER_KEY]),
         "seconds": round(time.monotonic() - started, 1),
     }
     marker.write_text(json.dumps(done, indent=2) + "\n")
@@ -309,18 +330,27 @@ def write_shard(directory: Path, index: int, table: pa.Table) -> None:
                    compression="zstd", row_group_size=params["row_group_rows"])
 
 
-def copy_rejections(out: Path, tokens: Path) -> dict:
-    """Carry the tokenize step's rejection records into the dataset."""
-    source_dir = tokens / "rejected"
-    destination = out / "rejected"
-    destination.mkdir(parents=True, exist_ok=True)
-    if source_dir.is_dir():
-        for path in sorted(source_dir.glob("*.jsonl")):
-            shutil.copyfile(path, destination / path.name)
-    # tally_rejections appends rejected/ itself: the output's root goes
-    # in, not its rejected/ directory (which once tallied the empty
-    # rejected/rejected and reported none).
-    return tally_rejections(out)
+def copy_rejections(out: Path, tokens: Path, wanted_shards: int) -> dict:
+    """Publish the staged rejection records as <out>/rejected.parquet.
+
+    The tokenize step stages them per shard as jsonl; here they become
+    one Parquet table, sequence_id and reason, rows sorted by id -- the
+    repository's shape for tabular data, and a file the Hub keeps in
+    LFS, where a jsonl this small would sit in git itself.
+    """
+    records = staged_rejections(tokens, wanted_shards)
+    table = pa.table({
+        "sequence_id": [record[0] for record in records],
+        "reason": [record[1] for record in records],
+    }, schema=REJECTIONS)
+    destination = out / "rejected.parquet"
+    pq.write_table(table, destination, compression="zstd",
+                   row_group_size=params["row_group_rows"])
+    written = pq.ParquetFile(destination)
+    if written.metadata.num_rows != len(records):
+        die(f"{destination}: wrote {len(records)} rows, the footer says "
+            f"{written.metadata.num_rows}")
+    return tally(records)
 
 
 def verify(out: Path) -> dict:
@@ -366,6 +396,16 @@ def verify(out: Path) -> dict:
                         die(f"{shard}: tokenizer {field} disagrees")
             rows += footer.metadata.num_rows
         report[split] = {"shards": len(shards), "rows": rows}
+    rejected = out / "rejected.parquet"
+    if not rejected.is_file():
+        die(f"{rejected}: missing")
+    footer = pq.ParquetFile(rejected)
+    schema = footer.schema_arrow
+    if [(f.name, f.type) for f in schema] != [
+        (f.name, f.type) for f in REJECTIONS
+    ]:
+        die(f"{rejected}: schema is {schema}, expected {REJECTIONS}")
+    report["rejected"] = {"file": rejected.name, "rows": footer.metadata.num_rows}
     return report
 
 
@@ -394,6 +434,11 @@ def main() -> None:
         if summary["verify"][split]["rows"] != summary["split"]["rows"][split]:
             die(f"{split}: verify counted {summary['verify'][split]['rows']} "
                 f"rows, the split wrote {summary['split']['rows'][split]}")
+    if (summary["verify"]["rejected"]["rows"]
+            != summary["split"]["rejected"]["total"]):
+        die(f"rejected: verify counted "
+            f"{summary['verify']['rejected']['rows']} rows, the split wrote "
+            f"{summary['split']['rejected']['total']}")
     print(json.dumps(summary, indent=2))
     (out / ".work" / "build-summary.json").write_text(
         json.dumps(summary, indent=2) + "\n")

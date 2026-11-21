@@ -6,7 +6,8 @@ datascience@1.2.0 (or stok@1.0.0, where it additionally runs STok's own
 read_source over every split):
 
   layout    train/, validation/ and test/ hold shards numbered 00000.parquet
-            onward without a gap; rejected/ holds the tokenize step's records.
+            onward without a gap; rejected.parquet holds the tokenize step's
+            records.
   schema    train is exactly sequence_id, sequence, structure_tokens
             (list<int16>), mean_plddt, uniprot_accession; validation and test
             add coordinates (list<list<list<float32>>>) after
@@ -143,7 +144,7 @@ def main() -> None:
             fail("rejected", f"{len(rejected_ids)} rejections against "
                              f"{rows['train']} train rows")
     else:
-        fail("layout", f"{out / 'rejected'} holds no rejection records")
+        fail("layout", f"{out / 'rejected.parquet'} holds no rejection records")
 
     # Sampled rows, whole.
     for split in SPLITS:
@@ -229,20 +230,34 @@ def collect_ids(paths, split, forbidden=None):
 
 
 def rejected(out: Path):
-    """The rejection records' ids, or None when the directory is missing."""
-    directory = out / "rejected"
-    if not directory.is_dir():
+    """The rejection records' ids, or None when the file is missing.
+
+    rejected.parquet: sequence_id and reason columns, rows sorted by id,
+    every reason non-empty, no id twice.
+    """
+    path = out / "rejected.parquet"
+    if not path.is_file():
         return None
+    table = pq.read_table(path)
+    if [(f.name, f.type) for f in table.schema] != [
+        ("sequence_id", pa.string()), ("reason", pa.string())
+    ]:
+        fail("rejected", f"{path}: schema is {table.schema.names}, expected "
+                         "sequence_id, reason")
+        return None
+    rows = table.to_pylist()
+    if [row["sequence_id"] for row in rows] != sorted(
+            row["sequence_id"] for row in rows):
+        fail("rejected", f"{path}: rows are not sorted by id")
     ids = set()
-    for path in sorted(directory.glob("*.jsonl")):
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            entry = json.loads(line)
-            if "sequence_id" not in entry or "reason" not in entry:
-                fail("rejected", f"{path}: {entry} is not a rejection record")
-                continue
-            ids.add(entry["sequence_id"])
+    for row in rows:
+        if not row["reason"]:
+            fail("rejected", f"{row['sequence_id']}: empty reason")
+            continue
+        if row["sequence_id"] in ids:
+            fail("rejected", f"{row['sequence_id']} appears twice")
+            continue
+        ids.add(row["sequence_id"])
     return ids
 
 
