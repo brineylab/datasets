@@ -1,0 +1,293 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/test <out>: exit 0 iff <out> holds a version of afdb-rep-stok-large.
+
+From the shards' parquet footers, light columns and sampled row groups, in
+datascience@1.2.0 (or stok@1.0.0, where it additionally runs STok's own
+read_source over every split):
+
+  layout    train/, validation/ and test/ hold shards numbered 00000.parquet
+            onward without a gap; rejected/ holds the tokenize step's records.
+  schema    train is exactly sequence_id, sequence, structure_tokens
+            (list<int16>), mean_plddt, uniprot_accession; validation and test
+            add coordinates (list<list<list<float32>>>) after
+            structure_tokens.
+  identity  every shard of every split carries the same stok.tokenizer
+            metadata: preset large, codebook 4096, the pinned checkpoint
+            sha256 -- the identity downstream training pins.
+  rows      each split is at least its floor, the holdouts sit within 0.5% +/-
+            0.15% of all rows, and no split is empty.
+  split     no sequence_id in two splits, none repeated within one, ids
+            sorted within each split, no rejected sequence_id among the rows:
+            the split is a partition of the accepted ids.
+  rows      16 sampled rows a split: structure_tokens one per residue and
+            aligned with coordinates, tokens null or in [0, 4096), every
+            all-null coordinate residue null in tokens too, mean_plddt in
+            [0, 100], the id is AF-<accession>-F1 matching
+            uniprot_accession, the sequence is uppercase letters.
+
+One line per failure, naming the check and the first offending row; a line
+per check group on success."""
+import json
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+NAME = "afdb-rep-stok-large"
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+TOKENIZER_KEY = b"stok.tokenizer"
+IDENTITY = ("preset", "checkpoint_sha256", "codebook_sha256", "codebook_size")
+SPLITS = ("train", "validation", "test")
+FLOORS = {"train": "train_floor", "validation": "validation_floor",
+          "test": "test_floor"}
+ID = re.compile(r"^AF-([0-9A-Za-z]+(?:-[0-9]+)?)-F1$")
+SEQUENCE = re.compile(r"^[A-Z]+$")
+TRAIN_FIELDS = [("sequence_id", pa.string()), ("sequence", pa.string()),
+                ("structure_tokens", pa.list_(pa.int16())),
+                ("mean_plddt", pa.float64()),
+                ("uniprot_accession", pa.string())]
+HELDOUT_FIELDS = TRAIN_FIELDS[:3] + [
+    ("coordinates", pa.list_(pa.list_(pa.list_(pa.float32())))),
+] + TRAIN_FIELDS[3:]
+SCHEMAS = {"train": TRAIN_FIELDS, "validation": HELDOUT_FIELDS,
+           "test": HELDOUT_FIELDS}
+failures = []
+
+
+def fail(check: str, detail: str) -> None:
+    failures.append(f"{NAME}: {check}: {detail}")
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        sys.exit("usage: recipe/test <out>")
+    out = Path(sys.argv[1]).resolve()
+
+    shards, identity, rows = {}, None, {}
+    for split in SPLITS:
+        paths = sorted((out / split).glob("*.parquet"))
+        if not paths:
+            fail("layout", f"{out / split} holds no shards")
+            continue
+        for position, path in enumerate(paths):
+            if path.name != f"{position:05d}.parquet":
+                fail("layout", f"{out / split}: {path.name} breaks the numbering")
+        total = 0
+        for path in paths:
+            footer = pq.ParquetFile(path)
+            schema = footer.schema_arrow
+            wanted = [(name, type) for name, type in SCHEMAS[split]]
+            if [(f.name, f.type) for f in schema] != wanted:
+                fail("schema", f"{path}: {schema.names} is not {wanted}")
+                continue
+            raw = (schema.metadata or {}).get(TOKENIZER_KEY)
+            if raw is None:
+                fail("identity", f"{path}: no stok.tokenizer metadata")
+                continue
+            current = json.loads(raw)
+            if identity is None:
+                identity = current
+                for field, value in (
+                    ("preset", params["preset"]),
+                    ("codebook_size", params["codebook_size"]),
+                    ("checkpoint_sha256", params["checkpoint_sha256"]),
+                ):
+                    if identity.get(field) != value:
+                        fail("identity", f"{path}: {field} is "
+                                         f"{identity.get(field)!r}, expected {value!r}")
+            else:
+                for field in IDENTITY:
+                    if current.get(field) != identity.get(field):
+                        fail("identity", f"{path}: {field} is "
+                                         f"{current.get(field)!r}, the first "
+                                         f"shard said {identity.get(field)!r}")
+            total += footer.metadata.num_rows
+        shards[split] = paths
+        rows[split] = total
+    if identity is None or len(shards) != len(SPLITS):
+        for line in failures:
+            print(line)
+        sys.exit(f"{NAME}: cannot test further without shards and identity")
+
+    for split in SPLITS:
+        floor = params[FLOORS[split]]
+        if rows[split] < floor:
+            fail("rows", f"{split} holds {rows[split]} rows, under the floor "
+                        f"{floor}")
+    total = sum(rows.values())
+    tolerance = params["split_tolerance"]
+    for split in ("validation", "test"):
+        share = rows[split] / total
+        if not (0.005 - tolerance) <= share <= (0.005 + tolerance):
+            fail("rows", f"{split} is {share:.3%} of {total} rows; expected "
+                         f"0.5% +/- {tolerance:.1%}")
+
+    # The split is a partition of the accepted ids: streamed once per split.
+    val_ids = collect_ids(shards["validation"], "validation")
+    test_ids = collect_ids(shards["test"], "test")
+    holdout = val_ids | test_ids
+    if val_ids & test_ids:
+        fail("split", f"{sorted(val_ids & test_ids)[:3]} are in validation "
+                      "and test")
+    train_ids = collect_ids(shards["train"], "train", holdout)
+    rejected_ids = rejected(out)
+    rejected_total = 0 if rejected_ids is None else len(rejected_ids)
+    if rejected_ids is not None:
+        overlap = rejected_ids & (holdout | train_ids)
+        if overlap:
+            fail("rejected", f"{sorted(overlap)[:3]} are rejected and rows")
+        if len(rejected_ids) >= rows["train"]:
+            fail("rejected", f"{len(rejected_ids)} rejections against "
+                             f"{rows['train']} train rows")
+    else:
+        fail("layout", f"{out / 'rejected'} holds no rejection records")
+
+    # Sampled rows, whole.
+    for split in SPLITS:
+        paths = shards[split]
+        picks = [paths[0], paths[len(paths) // 2], paths[-1]]
+        checked = 0
+        for path in picks:
+            footer = pq.ParquetFile(path)
+            groups = footer.num_row_groups
+            table = pa.concat_tables(
+                [footer.read_row_group(0), footer.read_row_group(groups - 1)])
+            sample = [table.slice(min(i, table.num_rows - 1), 1).to_pylist()[0]
+                      for i in range(0, table.num_rows,
+                                    max(1, table.num_rows // 6))][:6]
+            for row in sample:
+                check_row(split, path, row)
+                checked += 1
+        if checked < 6:
+            fail("rows", f"{split}: sampled only {checked} rows")
+
+    # STok's own reader, when this runs where stok is importable.
+    try:
+        from stok.data.format import read_source
+    except ImportError:
+        print("note: stok is not importable here (the cook's image is "
+              "datascience, which scripts/push needs online); the footer and "
+              "schema checks above are read_source's contract, and the "
+              "campaign's stok-image run of this test exercised read_source "
+              "itself")
+    else:
+        for split in SPLITS:
+            summary = read_source(out / split)
+            if summary["rows"] != rows[split]:
+                fail("read_source", f"{split}: {summary['rows']} rows, footers "
+                                    f"say {rows[split]}")
+            if summary["tokenizer"] != identity:
+                fail("read_source", f"{split}: tokenizer disagrees")
+            if not summary["structure"]:
+                fail("read_source", f"{split}: no structure_tokens")
+            if split != "train" and not summary["coordinates"]:
+                fail("read_source", f"{split}: no coordinates")
+            if split == "train" and summary["coordinates"]:
+                fail("read_source", f"{split}: train carries coordinates")
+        print("ok: read_source loaded every split (stok image)")
+
+    if failures:
+        for line in failures:
+            print(line)
+        sys.exit(f"{NAME}: {len(failures)} failures")
+    print(f"ok: {len(shards['train'])}+{len(shards['validation'])}+"
+          f"{len(shards['test'])} shards, {total} rows "
+          f"(train {rows['train']}, validation {rows['validation']}, "
+          f"test {rows['test']}), {rejected_total} rejected")
+    print(f"ok: identity preset {identity['preset']}, codebook "
+          f"{identity['codebook_size']}, checkpoint "
+          f"{identity['checkpoint_sha256'][:12]}..., stok "
+          f"{identity.get('stok_version')}")
+    print(f"ok: schemas, sorted unique ids, disjoint splits, aligned tokens, "
+          f"sampled rows whole")
+
+
+def collect_ids(paths, split, forbidden=None):
+    """A split's ids: unique, sorted within shards, in no other split."""
+    ids = set()
+    previous = None
+    for path in paths:
+        block = pq.read_table(path, columns=["sequence_id"])
+        current = block.column("sequence_id").to_pylist()
+        if current != sorted(current):
+            fail("split", f"{path}: sequence_ids are not sorted")
+        if previous is not None and current and previous > current[0]:
+            fail("split", f"{path}: ids decrease across shards")
+        if current:
+            previous = current[-1]
+        for sequence_id in current:
+            if sequence_id in ids:
+                fail("split", f"{sequence_id} appears twice in {split}")
+            if forbidden is not None and sequence_id in forbidden:
+                fail("split", f"{sequence_id} is a {split} row and a holdout "
+                              "row")
+            ids.add(sequence_id)
+    return ids
+
+
+def rejected(out: Path):
+    """The rejection records' ids, or None when the directory is missing."""
+    directory = out / "rejected"
+    if not directory.is_dir():
+        return None
+    ids = set()
+    for path in sorted(directory.glob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if "sequence_id" not in entry or "reason" not in entry:
+                fail("rejected", f"{path}: {entry} is not a rejection record")
+                continue
+            ids.add(entry["sequence_id"])
+    return ids
+
+
+def check_row(split: str, path: Path, row) -> None:
+    sequence_id = row["sequence_id"]
+    where = f"{path.name}:{sequence_id}"
+    match = ID.match(sequence_id or "")
+    if not match:
+        fail("rows", f"{where}: id matches no AF-<accession>-F1")
+        return
+    if row["uniprot_accession"] != match.group(1):
+        fail("rows", f"{where}: uniprot_accession "
+                    f"{row['uniprot_accession']!r} disagrees with the id")
+    if not SEQUENCE.match(row["sequence"] or ""):
+        fail("rows", f"{where}: sequence is not uppercase letters")
+    if not 0 <= (row["mean_plddt"] or -1) <= 100:
+        fail("rows", f"{where}: mean_plddt {row['mean_plddt']}")
+    tokens = row["structure_tokens"]
+    if tokens is None or len(tokens) != len(row["sequence"]):
+        fail("rows", f"{where}: {None if tokens is None else len(tokens)} "
+                    f"tokens for {len(row['sequence'])} residues")
+        return
+    for token in tokens:
+        if token is not None and not 0 <= token < params["codebook_size"]:
+            fail("rows", f"{where}: token {token}")
+            break
+    coordinates = row.get("coordinates")
+    if split == "train":
+        if coordinates is not None:
+            fail("rows", f"{where}: train row carries coordinates")
+        return
+    if coordinates is None or len(coordinates) != len(tokens):
+        fail("rows", f"{where}: coordinates do not align")
+        return
+    nulls = {i for i, token in enumerate(tokens) if token is None}
+    for index, residue in enumerate(coordinates):
+        if len(residue) != 3 or any(len(atom) != 3 for atom in residue):
+            fail("rows", f"{where}: residue {index} is not [3][3]")
+            return
+        if all(atom == [None, None, None] for atom in residue) \
+                and index not in nulls:
+            fail("rows", f"{where}: residue {index} has no coordinates but a "
+                         "token")
+            return
+
+
+if __name__ == "__main__":
+    main()

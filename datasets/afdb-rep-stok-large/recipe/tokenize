@@ -1,0 +1,124 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/tokenize <out>: the GPU step of afdb-rep-stok-large, in stok@1.0.0.
+
+Runs STok's tokenize-structures over the source recipe/build staged (see
+.work/source.json) into <out>/.work/tokens, one output shard per input shard,
+with the coordinates column included.  The environment names the job:
+
+  NUM_JOBS  job count of the shard-parallel split (default 1)
+  JOB_INDEX this job's index, 0 <= JOB_INDEX < NUM_JOBS (default 0)
+  DEVICE    the device to encode on (default cuda:0)
+
+Job I of N takes every N-th input shard; finished output shards are skipped
+and interrupted ones redone, so the jobs run concurrently without touching
+each other's shards and a preempted job simply runs again.  STok's fixed
+training-native-reference policy applies (full chains of 25-1280 residues,
+native sequences, reference imputation, FP32, one structure at a time), and
+every rejected structure lands in .work/tokens/rejected/<shard>.jsonl.
+
+Reads .work/source.json (run recipe/build first, in datascience@1.2.0, to
+stage the source); never reaches the network.  Prints the CLI's output, then
+a JSON summary (shards, rows, rejections, elapsed seconds, peak GPU memory),
+and writes it to $FLYLOFT_OUT when set.
+"""
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+NAME = "afdb-rep-stok-large"
+
+
+def die(message: str) -> None:
+    sys.exit(f"{NAME}: {message}")
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        die("usage: recipe/tokenize <out>")
+    out = Path(sys.argv[1]).resolve()
+    source = out / ".work" / "source.json"
+    if not source.is_file():
+        die(f"{source} is missing: run recipe/build (datascience@1.2.0) first "
+            "to stage the afdb-rep source, then this step")
+    data = json.loads(source.read_text())
+    if "data" not in data:
+        die(f"{source} names no data directory (was the source staged?)")
+    num_jobs = int(os.environ.get("NUM_JOBS", "1"))
+    job_index = int(os.environ.get("JOB_INDEX", "0"))
+    device = os.environ.get("DEVICE", "cuda:0")
+    if not 0 <= job_index < num_jobs:
+        die(f"JOB_INDEX {job_index} out of range for NUM_JOBS {num_jobs}")
+    tokens = out / ".work" / "tokens"
+    tokens.mkdir(parents=True, exist_ok=True)
+    command = [
+        "stok", "tokenize-structures", data["data"], str(tokens),
+        "--preset", "large", "--device", device,
+        "--text-column", "cif", "--id-column", "id",
+        "--keep-column", "mean_plddt", "--keep-column", "uniprot_accession",
+        "--include-coordinates",
+        "--num-jobs", str(num_jobs), "--job-index", str(job_index),
+    ]
+    print("$ " + " ".join(command), flush=True)
+
+    peak = {"mib": 0}
+    stop = threading.Event()
+
+    def monitor() -> None:
+        while not stop.wait(10):
+            try:
+                text = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.used",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=30,
+                ).stdout
+                for line in text.splitlines():
+                    peak["mib"] = max(peak["mib"], int(line.strip()))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+
+    watcher = threading.Thread(target=monitor, daemon=True)
+    watcher.start()
+    started = time.monotonic()
+    process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+    lines = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        lines.append(line)
+    code = process.wait()
+    stop.set()
+    watcher.join(timeout=35)
+    elapsed = time.monotonic() - started
+    if code != 0:
+        die(f"stok tokenize-structures exited {code}")
+
+    import pyarrow.parquet as pq
+
+    shards = sorted(tokens.glob("*.parquet"))
+    rows = sum(pq.ParquetFile(shard).metadata.num_rows for shard in shards)
+    rejected = 0
+    for path in sorted((tokens / "rejected").glob("*.jsonl")):
+        rejected += sum(1 for line in path.read_text().splitlines()
+                        if line.strip())
+    summary = {
+        "num_jobs": num_jobs, "job_index": job_index, "device": device,
+        "seconds": round(elapsed, 1), "rows_per_second": round(rows / elapsed, 2)
+        if elapsed else None,
+        "shards_staged": len(shards), "rows_staged": rows,
+        "rejected_staged": rejected, "peak_gpu_mib": peak["mib"],
+        "cli_last_line": lines[-1].strip() if lines else "",
+    }
+    print(json.dumps(summary, indent=2))
+    flyloft_out = os.environ.get("FLYLOFT_OUT")
+    if flyloft_out and Path(flyloft_out).is_dir():
+        Path(flyloft_out, "tokenize-summary.json").write_text(
+            json.dumps(summary, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()
