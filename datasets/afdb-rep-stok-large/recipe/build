@@ -1,0 +1,457 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/build <out>: afdb-rep-stok-large, in datascience@1.2.0 (CPU, network).
+
+Every afdb-rep@v1.0.0 structure as STok structure tokens (GCP-VQVAE Large,
+4096-entry codebook, one nullable int16 per residue), split once into train/,
+validation/ and test/.  Four stages, each skipped when a rerun finds it
+finished, so a cook -- and a campaign that staged the GPU step's output under
+<out>/.work/tokens -- resumes for free:
+
+  source  brineylab/afdb-rep@v1.0.0, pulled with snapshot_download into
+          <out>/.work/hf-cache (a cache inside the dataset's own directory:
+          the recorded snapshot path is readable by the GPU step's stok image
+          and by any later cook, wherever HOME points on the node that runs
+          them) and recorded in <out>/.work/source.json with its pull date,
+          shard count and rows.  Skipped when the tokens are already staged:
+          the source feeds only the tokenize step.
+  tokens  <out>/.work/tokens must hold one Parquet shard per source shard,
+          written by the tokenize step (recipe/tokenize, stok@1.0.0, GPU --
+          this image has neither stok nor a GPU, so a from-nothing run
+          stages the source, prints that instruction and exits 0, and the
+          cook runs the tokenize step and then this one again).  Checked:
+          152 shards (or the first `limit` for a dry run), every footer
+          parses, every shard carries the same stok.tokenizer identity --
+          preset large, codebook 4096, the pinned checkpoint sha256 -- and
+          token rows + rejected rows == the source's 2,278,845: every source
+          row is a token row or a rejection, none is lost.
+  split   the fixed assignment, once, from sha256(sequence_id):
+          bucket = int.from_bytes(sha256(id)[:8], "big") % 1_000_000;
+          bucket < 5000 -> validation, bucket < 10000 -> test, else train --
+          0.5% each, deterministic, no id in two splits by construction.  Each
+          holdout split must land within 0.5% +/- 0.15% of all rows or the
+          build stops.  train/ drops the coordinates column; validation/ and
+          test/ keep it.  15000-row zstd shards, row groups of 2000, the
+          stok.tokenizer metadata preserved, rows in the tokens' order (sorted
+          by sequence_id).  The tokenize step's rejection records publish as one
+          Parquet file, <out>/rejected.parquet -- sequence_id, reason, rows
+          sorted by id: Parquet is the repository's shape for tabular data,
+          and the Hub keeps a Parquet file's bytes in LFS, where a jsonl
+          this small would sit in git itself, against the rule that the
+          bytes are on the Hub, never in git.
+          <out>/.work/split-done.json
+          marks the stage; a partial or stale split is wiped and redone from
+          the tokens, so the stage starts over cleanly rather than resuming.
+  verify  the output read back from its footers: shards numbered without
+          gaps, schemas exact, row counts, split sizes, rejected.parquet's
+          schema and rows, token rows +
+          rejected rows == every source row.
+
+With limit > 0 only the first limit token shards feed the split: a
+developer's dry run, whose test fails on the floors alone.  Prints the stage
+report, and writes it to <out>/.work/build-summary.json and, when set, to
+$FLYLOFT_OUT.
+"""
+import datetime
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+NAME = "afdb-rep-stok-large"
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+TOKENIZER_KEY = b"stok.tokenizer"
+IDENTITY = ("preset", "checkpoint_sha256", "codebook_sha256", "codebook_size")
+SPLITS = ("train", "validation", "test")
+TRAIN_COLUMNS = ("sequence_id", "sequence", "structure_tokens", "mean_plddt",
+                "uniprot_accession")
+REJECTIONS = pa.schema([("sequence_id", pa.string()), ("reason", pa.string())])
+
+
+def die(message: str) -> None:
+    sys.exit(f"{NAME}: {message}")
+
+
+def bucket(sequence_id: str) -> int:
+    return int.from_bytes(hashlib.sha256(sequence_id.encode()).digest()[:8],
+                          "big") % 1_000_000
+
+
+def split_of(sequence_id: str) -> str:
+    value = bucket(sequence_id)
+    if value < params["validation_bound"]:
+        return "validation"
+    if value < params["test_bound"]:
+        return "test"
+    return "train"
+
+
+def source(out: Path, wanted_shards: int) -> dict:
+    """Stage afdb-rep@v1.0.0; skipped when the tokens are already there."""
+    work = out / ".work"
+    record = work / "source.json"
+    tokens = work / "tokens"
+    if record.is_file():
+        return json.loads(record.read_text())
+    if tokens.is_dir() and sorted(tokens.glob("*.parquet")):
+        return {"skipped": "the tokenize step's output is already staged"}
+    from huggingface_hub import snapshot_download
+
+    print("== source: pulling afdb-rep@v1.0.0", flush=True)
+    started = time.monotonic()
+    path = Path(snapshot_download(params["repository"], repo_type="dataset",
+                                   revision=params["revision"],
+                                   cache_dir=str(work / "hf-cache")))
+    shards = sorted((path / "data").glob("*.parquet"))
+    if len(shards) != wanted_shards:
+        die(f"{path}: {len(shards)} shards, expected {wanted_shards}")
+    rows = 0
+    for shard in shards:
+        rows += pq.ParquetFile(shard).metadata.num_rows
+    if rows != params["source_rows"]:
+        die(f"{path}: {rows} rows, expected {params['source_rows']}")
+    record_data = {
+        "repository": params["repository"], "revision": params["revision"],
+        "path": str(path), "data": str(path / "data"), "shards": len(shards),
+        "rows": rows, "bytes": sum(s.stat().st_size for s in shards),
+        "pulled": datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"),
+        "seconds": round(time.monotonic() - started, 1),
+    }
+    record.write_text(json.dumps(record_data, indent=2) + "\n")
+    return record_data
+
+
+def token_state(out: Path, wanted_shards: int) -> dict:
+    """Verify the staged tokens: completeness, identity, nothing lost.
+
+    The nothing-lost check counts the source rows of exactly the first
+    `wanted_shards` shards, so a limit > 0 dry run (which stages and splits
+    only the first shards) checks what it reads, not the whole set.
+    """
+    work = out / ".work"
+    tokens = work / "tokens"
+    shards = sorted(tokens.glob("*.parquet")) if tokens.is_dir() else []
+    if not shards:
+        message = (f"== tokens: none staged under {tokens}; the source is "
+                   "staged -- run the tokenize step (recipe/tokenize, "
+                   "stok@1.0.0, GPU) as the skill documents, then this step "
+                   "again")
+        print(message, flush=True)
+        flyloft_out = os.environ.get("FLYLOFT_OUT")
+        if flyloft_out and Path(flyloft_out).is_dir():
+            source_record = work / "source.json"
+            staged = {"instruction": message}
+            if source_record.is_file():
+                staged["source"] = json.loads(source_record.read_text())
+            Path(flyloft_out, "source-staged.json").write_text(
+                json.dumps(staged, indent=2) + "\n"
+            )
+        sys.exit(0)
+    if len(shards) < wanted_shards:
+        missing = wanted_shards - len(shards)
+        die(f"{tokens}: {len(shards)} of {wanted_shards} shards staged; "
+            f"{missing} missing. Run the tokenize step (recipe/tokenize, "
+            "stok@1.0.0, GPU) as the skill documents, then recipe/build again")
+    shards = shards[:wanted_shards]
+    record = work / "source.json"
+    if not record.is_file():
+        die(f"{record} is missing: stage the source first (recipe/build with "
+            "no tokens staged does it)")
+    data = json.loads(record.read_text())
+    if "data" not in data:
+        die(f"{record} names no data directory (was the source staged?)")
+    source_shards = sorted(Path(data["data"]).glob("*.parquet"))
+    if len(source_shards) < wanted_shards:
+        die(f"{data['data']}: {len(source_shards)} source shards, fewer than "
+            f"the {wanted_shards} wanted")
+    expected = sum(pq.ParquetFile(shard).metadata.num_rows
+                   for shard in source_shards[:wanted_shards])
+    identity, rows = None, 0
+    for shard in shards[: wanted_shards]:
+        footer = pq.ParquetFile(shard)
+        schema = footer.schema_arrow
+        raw = (schema.metadata or {}).get(TOKENIZER_KEY)
+        if raw is None:
+            die(f"{shard}: no {TOKENIZER_KEY.decode()} metadata")
+        current = json.loads(raw)
+        if identity is None:
+            identity = current
+            for field, value in (
+                ("preset", params["preset"]),
+                ("checkpoint_sha256", params["checkpoint_sha256"]),
+                ("codebook_size", params["codebook_size"]),
+            ):
+                if identity.get(field) != value:
+                    die(f"{shard}: tokenizer {field} is "
+                        f"{identity.get(field)!r}, expected {value!r}")
+        else:
+            for field in IDENTITY:
+                if current.get(field) != identity.get(field):
+                    die(f"{shard}: tokenizer {field} is {current.get(field)!r}, "
+                        f"the first shard says {identity.get(field)!r}")
+        rows += footer.metadata.num_rows
+    rejected = tally(staged_rejections(tokens, wanted_shards))
+    if rows + rejected["total"] != expected:
+        die(f"{tokens}: {rows} token rows + {rejected['total']} rejected is "
+            f"not the {expected} rows of the source's first "
+            f"{wanted_shards} shards")
+    return {"shards": len(shards), "rows": rows, "identity": identity,
+            "rejected": rejected}
+
+
+def staged_rejections(tokens: Path, wanted: int = 0) -> list[tuple[str, str]]:
+    """Every staged rejection record, the first `wanted` shards only.
+
+    The tokenize step stages them as jsonl, one file per token shard
+    (rejected/00000.jsonl, ...); this reads them back as (sequence_id,
+    reason) tuples, sorted by id.
+    """
+    directory = tokens / "rejected"
+    paths = sorted(directory.glob("*.jsonl")) if directory.is_dir() else []
+    if wanted:
+        paths = [path for path in paths if int(path.stem) < wanted]
+    records: list[tuple[str, str]] = []
+    for path in paths:
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            records.append((entry["sequence_id"], entry["reason"]))
+    records.sort()
+    return records
+
+
+def tally(records: list[tuple[str, str]]) -> dict:
+    """Rejection records counted, by reason."""
+    reasons: dict[str, int] = {}
+    for _, reason in records:
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return {"total": len(records), "by_reason": dict(sorted(reasons.items()))}
+
+
+def wipe_partial(out: Path) -> None:
+    # "rejected" is the pre-1.0.1 directory of copied jsonl files; a
+    # rerun in the parquet format wipes it along with everything else.
+    for name in (*SPLITS, "rejected"):
+        shutil.rmtree(out / name, ignore_errors=True)
+    (out / "rejected.parquet").unlink(missing_ok=True)
+
+
+def run_split(out: Path, tokens: Path, wanted_shards: int) -> dict:
+    """The deterministic split, from the staged tokens."""
+    work = out / ".work"
+    marker = work / "split-done.json"
+    shards = sorted(tokens.glob("*.parquet"))[:wanted_shards]
+    expected = {"shards": len(shards)}
+    if marker.is_file():
+        done = json.loads(marker.read_text())
+        if (done.get("tokens_shards") == len(shards)
+                and done.get("rejected_format") == "parquet"):
+            return done
+        print(f"== split: marker names {done.get('tokens_shards')} token "
+              f"shards (rejections as {done.get('rejected_format')}), now "
+              f"{len(shards)} shards; redoing the split", flush=True)
+    wipe_partial(out)
+    print(f"== split: {len(shards)} token shards -> train/validation/test",
+          flush=True)
+    started = time.monotonic()
+    metadata = pq.read_schema(shards[0]).metadata
+    if metadata is None or TOKENIZER_KEY not in metadata:
+        die(f"{shards[0]}: no tokenizer metadata")
+    written = {split: 0 for split in SPLITS}
+    queues = {split: [] for split in SPLITS}
+    queue_rows = {split: 0 for split in SPLITS}
+    for path in shards:
+        table = pq.read_table(path)
+        if not table.schema.metadata or TOKENIZER_KEY not in table.schema.metadata:
+            die(f"{path}: lost its tokenizer metadata")
+        assignment = {split: [] for split in SPLITS}
+        for index, sequence_id in enumerate(
+            table.column("sequence_id").to_pylist()
+        ):
+            assignment[split_of(sequence_id)].append(index)
+        for split in SPLITS:
+            if not assignment[split]:
+                continue
+            part = table.take(assignment[split])
+            if split == "train":
+                part = part.drop_columns(["coordinates"])
+            part = part.replace_schema_metadata(metadata)
+            queues[split].append(part)
+            queue_rows[split] += part.num_rows
+            while queue_rows[split] >= params["shard_rows"]:
+                merged = pa.concat_tables(queues[split])
+                write_shard(out / split, written[split],
+                            merged.slice(0, params["shard_rows"]))
+                written[split] += 1
+                rest = merged.slice(params["shard_rows"])
+                queues[split] = [rest]
+                queue_rows[split] = rest.num_rows
+    for split in SPLITS:
+        if queue_rows[split] > 0:
+            write_shard(out / split, written[split],
+                        pa.concat_tables(queues[split]))
+            written[split] += 1
+    # The queues are gone, so count what was written from the footers.
+    counts = {split: sum(pq.ParquetFile(path).metadata.num_rows
+                         for path in sorted((out / split).glob("*.parquet")))
+              for split in SPLITS}
+    rejected = copy_rejections(out, tokens, wanted_shards)
+    total = sum(counts.values())
+    tolerance = params["split_tolerance"]
+    for split in ("validation", "test"):
+        share = counts[split] / total if total else 0
+        if not (0.005 - tolerance) <= share <= (0.005 + tolerance):
+            die(f"{split} is {counts[split]} of {total} rows ({share:.3%}); "
+                "the split rule should give 0.5% +/- "
+                f"{tolerance:.1%}")
+    done = {
+        "tokens_shards": len(shards), "rows": counts, "total": total,
+        "shards": {split: len(sorted((out / split).glob("*.parquet")))
+                   for split in SPLITS},
+        "rejected": rejected, "rejected_format": "parquet",
+        "identity": json.loads(metadata[TOKENIZER_KEY]),
+        "seconds": round(time.monotonic() - started, 1),
+    }
+    marker.write_text(json.dumps(done, indent=2) + "\n")
+    return done
+
+
+def write_shard(directory: Path, index: int, table: pa.Table) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, directory / f"{index:05d}.parquet",
+                   compression="zstd", row_group_size=params["row_group_rows"])
+
+
+def copy_rejections(out: Path, tokens: Path, wanted_shards: int) -> dict:
+    """Publish the staged rejection records as <out>/rejected.parquet.
+
+    The tokenize step stages them per shard as jsonl; here they become
+    one Parquet table, sequence_id and reason, rows sorted by id -- the
+    repository's shape for tabular data, and a file the Hub keeps in
+    LFS, where a jsonl this small would sit in git itself.
+    """
+    records = staged_rejections(tokens, wanted_shards)
+    table = pa.table({
+        "sequence_id": [record[0] for record in records],
+        "reason": [record[1] for record in records],
+    }, schema=REJECTIONS)
+    destination = out / "rejected.parquet"
+    pq.write_table(table, destination, compression="zstd",
+                   row_group_size=params["row_group_rows"])
+    written = pq.ParquetFile(destination)
+    if written.metadata.num_rows != len(records):
+        die(f"{destination}: wrote {len(records)} rows, the footer says "
+            f"{written.metadata.num_rows}")
+    return tally(records)
+
+
+def verify(out: Path) -> dict:
+    """Read the output back from its footers."""
+    schemas = {
+        "train": pa.schema([
+            ("sequence_id", pa.string()), ("sequence", pa.string()),
+            ("structure_tokens", pa.list_(pa.int16())),
+            ("mean_plddt", pa.float64()), ("uniprot_accession", pa.string()),
+        ]),
+        "validation": pa.schema([
+            ("sequence_id", pa.string()), ("sequence", pa.string()),
+            ("structure_tokens", pa.list_(pa.int16())),
+            ("coordinates", pa.list_(pa.list_(pa.list_(pa.float32())))),
+            ("mean_plddt", pa.float64()), ("uniprot_accession", pa.string()),
+        ]),
+    }
+    schemas["test"] = schemas["validation"]
+    report = {}
+    for split in SPLITS:
+        shards = sorted((out / split).glob("*.parquet"))
+        if not shards:
+            die(f"{out / split}: no shards")
+        rows, identity = 0, None
+        for position, shard in enumerate(shards):
+            if shard.name != f"{position:05d}.parquet":
+                die(f"{out / split}: {shard.name} breaks the numbering")
+            footer = pq.ParquetFile(shard)
+            schema = footer.schema_arrow
+            wanted = schemas[split]
+            if [(f.name, f.type) for f in schema] != [
+                (f.name, f.type) for f in wanted
+            ]:
+                die(f"{shard}: schema is {schema}, expected {wanted}")
+            if not schema.metadata or TOKENIZER_KEY not in schema.metadata:
+                die(f"{shard}: no tokenizer metadata")
+            current = json.loads(schema.metadata[TOKENIZER_KEY])
+            if identity is None:
+                identity = current
+            else:
+                for field in IDENTITY:
+                    if current.get(field) != identity.get(field):
+                        die(f"{shard}: tokenizer {field} disagrees")
+            rows += footer.metadata.num_rows
+        report[split] = {"shards": len(shards), "rows": rows}
+    rejected = out / "rejected.parquet"
+    if not rejected.is_file():
+        die(f"{rejected}: missing")
+    footer = pq.ParquetFile(rejected)
+    schema = footer.schema_arrow
+    if [(f.name, f.type) for f in schema] != [
+        (f.name, f.type) for f in REJECTIONS
+    ]:
+        die(f"{rejected}: schema is {schema}, expected {REJECTIONS}")
+    report["rejected"] = {"file": rejected.name, "rows": footer.metadata.num_rows}
+    return report
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        die("usage: recipe/build <out>")
+    out = Path(sys.argv[1]).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    limit = params.get("limit", 0) or 0
+    wanted = limit if limit else params["source_shards"]
+    summary = {"name": NAME, "version_params": {
+        key: params[key] for key in (
+            "repository", "revision", "preset", "codebook_size",
+            "checkpoint_sha256", "validation_bound", "test_bound",
+            "shard_rows", "row_group_rows", "limit",
+        )
+    }}
+    # The source is always the whole published set; limit trims only the
+    # token shards the split reads (a dry run stages its tokens first).
+    summary["source"] = source(out, params["source_shards"])
+    tokens = token_state(out, wanted)
+    summary["tokens"] = tokens
+    summary["split"] = run_split(out, out / ".work" / "tokens", wanted)
+    summary["verify"] = verify(out)
+    for split in SPLITS:
+        if summary["verify"][split]["rows"] != summary["split"]["rows"][split]:
+            die(f"{split}: verify counted {summary['verify'][split]['rows']} "
+                f"rows, the split wrote {summary['split']['rows'][split]}")
+    if (summary["verify"]["rejected"]["rows"]
+            != summary["split"]["rejected"]["total"]):
+        die(f"rejected: verify counted "
+            f"{summary['verify']['rejected']['rows']} rows, the split wrote "
+            f"{summary['split']['rejected']['total']}")
+    print(json.dumps(summary, indent=2))
+    (out / ".work" / "build-summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n")
+    flyloft_out = os.environ.get("FLYLOFT_OUT")
+    if flyloft_out and Path(flyloft_out).is_dir():
+        Path(flyloft_out, "build-summary.json").write_text(
+            json.dumps(summary, indent=2) + "\n")
+    rows = {split: summary["verify"][split]["rows"] for split in SPLITS}
+    print(f"{NAME}: {sum(rows.values())} rows "
+          f"(train {rows['train']}, validation {rows['validation']}, "
+          f"test {rows['test']}), rejected "
+          f"{summary['tokens']['rejected']['total']}")
+
+
+if __name__ == "__main__":
+    main()

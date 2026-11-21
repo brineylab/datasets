@@ -1,0 +1,31 @@
+# afdb-rep-stok-large: every afdb-rep@v1.0.0 structure as STok GCP-VQVAE
+# Large structure tokens, split once into train/validation/test.
+
+repository = "brineylab/afdb-rep" # the source dataset, chained and published
+revision = "v1.0.0"
+source_shards = 152 # afdb-rep@v1.0.0's shard count
+source_rows = 2278845 # afdb-rep@v1.0.0's row count
+
+# The tokenizer identity every shard's stok.tokenizer metadata must carry.
+preset = "large" # GCP-VQVAE Large, stok's canonical name for the base preset
+codebook_size = 4096
+checkpoint_sha256 = "7d1d43950a29834e7f702409bf957e9ffb75eb3cb3952074ba4c545bb4130eaf"
+
+# The split, fixed once: bucket = int.from_bytes(sha256(sequence_id)[:8], "big")
+# % 1_000_000; bucket < validation_bound -> validation, bucket < test_bound ->
+# test, else train. 0.5% validation, 0.5% test, deterministic, and disjoint by
+# construction.
+validation_bound = 5000
+test_bound = 10000
+# Each holdout must land within 0.5% +/- this of all accepted rows.
+split_tolerance = 0.0015
+
+shard_rows = 15000
+row_group_rows = 2000
+
+# Test floors, about 90% of the first full build; a limit > 0 dry run fails on
+# these alone, so nothing is pushed.
+train_floor = 1900000
+validation_floor = 9000
+test_floor = 9000
+limit = 0
