@@ -3,7 +3,7 @@ name: afdb-rep-stok-large
 description: "Every structure in afdb-rep@1.0.0 — the 2.28M AlphaFold DB v4 Foldseek-cluster representatives — as STok structure tokens: one discrete GCP-VQVAE Large token (4096-entry codebook) per residue, null where the residue lacks a complete backbone, split once by a hash of the id into train, validation and test, the two hold-outs carrying the observed N/CA/C coordinates. Reach for it to train or evaluate STok's paired sequence-structure models on AlphaFold-predicted structures, or any model that consumes structure tokens."
 metadata:
   version: 1.0.0
-  tools: datascience@1.2.0 stok@1.0.0
+  tools: datascience@1.2.0
   license: cc-by-4.0
   count: 2277197
   unit: structures
@@ -39,7 +39,7 @@ STōk's `stok train` reads these directories directly as its plain dataset forma
 
 **Source:** `brineylab/afdb-rep@v1.0.0` (its 152 shards, 2,278,845 rows: id, uniprot_accession, sequence, length, mean_plddt, full mmCIF text), pulled 2026-11-21 into `<out>/.work/hf-cache` and recorded in `<out>/.work/source.json`. The structures are DeepMind's AFDB v4 predictions, CC BY 4.0.
 
-A split recipe, three programs in order — the tokenization needs a GPU the split does not, so it runs as its own step:
+A split recipe, three programs in order — the tokenization needs a GPU the split does not, so it runs as its own step outside the cook, in the stok image: a cook itself runs only the CPU programs, in the one image `metadata.tools` names, resuming from the tokens the submitter staged under `<out>/.work/tokens` (this campaign ran the GPU step as sixteen recorded one-B200 jobs and staged its output there before submitting):
 
 1. `recipe/build <out>` (datascience@1.2.0, CPU, network): stages the source, verifies its 152 shards and 2,278,845 rows, and — when `<out>/.work/tokens` holds nothing — prints the tokenize instruction and exits 0.
 2. `recipe/tokenize <out>` (stok@1.0.0, one GPU): `stok tokenize-structures <source>/data <out>/.work/tokens --preset large --text-column cif --id-column id --keep-column mean_plddt --keep-column uniprot_accession --include-coordinates`, shard-parallel through the `NUM_JOBS`/`JOB_INDEX` environment (job I of N takes every N-th input shard; job 0 of 152 is the one-shard pilot). One output shard per input shard, named for it. STōk's fixed training-native policy — full chains of 25–1,280 residues, native sequence inputs, reference imputation, FP32, one structure at a time — so token identity never depends on batching or sharding. Rejected rows land in `.work/tokens/rejected/NNNNN.jsonl`; finished output shards are skipped on a rerun, so a preempted job simply runs again.
