@@ -200,7 +200,12 @@ def token_state(out: Path, wanted_shards: int) -> dict:
 
 
 def tally_rejections(tokens: Path, wanted: int = 0) -> dict:
-    """Every rejection record, by reason; the first `wanted` shards only."""
+    """Every rejection record, by reason; the first `wanted` shards only.
+
+    `tokens` is the directory holding rejected/ (the tokens' root for the
+    staged set, the output's root for the copied set): the rejected
+    directory is appended here, never by the caller.
+    """
     total, reasons = 0, {}
     directory = tokens / "rejected"
     paths = sorted(directory.glob("*.jsonl")) if directory.is_dir() else []
@@ -312,7 +317,10 @@ def copy_rejections(out: Path, tokens: Path) -> dict:
     if source_dir.is_dir():
         for path in sorted(source_dir.glob("*.jsonl")):
             shutil.copyfile(path, destination / path.name)
-    return tally_rejections(out / "rejected")
+    # tally_rejections appends rejected/ itself: the output's root goes
+    # in, not its rejected/ directory (which once tallied the empty
+    # rejected/rejected and reported none).
+    return tally_rejections(out)
 
 
 def verify(out: Path) -> dict:

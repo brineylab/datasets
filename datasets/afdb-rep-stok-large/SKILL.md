@@ -3,7 +3,7 @@ name: afdb-rep-stok-large
 description: "Every structure in afdb-rep@1.0.0 — the 2.28M AlphaFold DB v4 Foldseek-cluster representatives — as STok structure tokens: one discrete GCP-VQVAE Large token (4096-entry codebook) per residue, null where the residue lacks a complete backbone, split once by a hash of the id into train, validation and test, the two hold-outs carrying the observed N/CA/C coordinates. Reach for it to train or evaluate STok's paired sequence-structure models on AlphaFold-predicted structures, or any model that consumes structure tokens."
 metadata:
   version: 1.0.0
-  tools: datascience@1.2.0
+  tools: datascience@1.2.0 stok@1.0.0
   license: cc-by-4.0
   count: 2277197
   unit: structures
