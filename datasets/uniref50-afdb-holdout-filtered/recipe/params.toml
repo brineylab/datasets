@@ -1,0 +1,39 @@
+# uniref50-afdb-holdout-filtered: uniref50@v1.0.0 minus every entry that is
+# a close homolog of an afdb-rep-stok-large validation or test protein.
+
+# The sources, both chained from published lab datasets.
+uniref50_repository = "brineylab/uniref50"
+uniref50_revision = "v1.0.0"
+uniref50_shards = 42 # uniref50@v1.0.0's shard count
+uniref50_rows = 41243524 # uniref50@v1.0.0's row count
+
+holdout_repository = "brineylab/afdb-rep-stok-large"
+holdout_revision = "v1.0.1"
+holdout_floor = 9000 # rows each of validation and test must hold
+# The tokenizer identity the holdout shards must carry, so the filter chains
+# exactly the published split: afdb-rep-stok-large's pinned Large checkpoint.
+checkpoint_sha256 = "7d1d43950a29834e7f702409bf957e9ffb75eb3cb3952074ba4c545bb4130eaf"
+
+# The MMseqs2 filter: a uniref50 entry is removed when a holdout protein
+# aligns to it at >= min_seq_id identity with both coverages >= coverage
+# (cov-mode 0), reported by the search at permissive evalue (the identity and
+# coverage criteria are the filter; the e-value only decides what MMseqs2
+# reports) with at most max_seqs targets kept per query per shard.
+min_seq_id = 0.5
+coverage = 0.8
+cov_mode = 0
+sensitivity = 7.5
+evalue = 100.0
+max_seqs = 2000
+
+sample_size = 8 # removed ids the test re-searches, with their sequences
+
+shard_rows = 1000000 # the output's shard size, uniref50's own
+row_group_rows = 100000
+
+# Test floors: the surviving rows must be at least this (about 8% of the
+# release may be removed; the expected removal is well under 1%), and when the
+# staged .work is present the count is checked exactly instead.  A limit > 0
+# dry run fails on the floor alone, so nothing is pushed.
+rows_floor = 38000000
+limit = 0

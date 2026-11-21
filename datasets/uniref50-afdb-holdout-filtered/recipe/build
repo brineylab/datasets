@@ -1,0 +1,521 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/build <out>: uniref50-afdb-holdout-filtered, in datascience@1.2.0 (CPU, network).
+
+uniref50@v1.0.0 minus every entry that is a close homolog of an
+afdb-rep-stok-large validation or test protein, so sequence
+pretraining cannot leak the structure dataset's held-out set.  Five stages,
+each skipped when a rerun finds it finished, so a cook -- and a campaign
+that staged the mmseqs stage's output under <out>/.work -- resumes for
+free:
+
+  sources  brineylab/uniref50@v1.0.0 (all 42 shards) and
+           brineylab/afdb-rep-stok-large at holdout_revision (its
+           validation/ and test/
+           splits only, the train shards are never pulled), through
+           snapshot_download into <out>/.work/hf-cache and recorded in
+           <out>/.work/sources.json with the pull date, shard counts and
+           rows.  Each holdout split must hold at least holdout_floor rows
+           and carry stok.tokenizer metadata naming the pinned Large
+           checkpoint, so the filter chains exactly the published split.
+  holdout  the validation and test proteins streamed to
+           <out>/.work/holdout.fasta -- ids unique across the union,
+           checked -- and counted in <out>/.work/holdout.json.
+  mmseqs   MMseqs2 search of the holdout queries (one query DB) against
+           every source shard's sequences in turn (one target DB per
+           uniref50 shard, a scratch directory per chunk -- search takes
+           four paths: query, target, result, scratch -- deleted with the
+           chunk's other litter, the same flags each time):
+             --min-seq-id 0.5 -c 0.8 --cov-mode 0 -s 7.5 -e 100
+             --max-seqs 2000
+           Every reported alignment's identity and both coverages are
+           re-checked in code against the same thresholds.  A shard's hit
+           target ids land in <out>/.work/mmseqs/chunks/NNNNN.ids, written
+           atomically -- a checkpoint a preempted run resumes from, one
+           shard at a time, redoing only the shard it was interrupted on.
+           Their sorted union becomes <out>/.work/removed-ids.txt, and the
+           MMseqs2 version and every flag are recorded in
+           <out>/.work/mmseqs/parameters.json.  The staged search records
+           the sha256 of the holdout fasta it ran against beside its
+           chunks; a build whose holdout digest differs wipes the staged
+           search rather than resuming from it, so the filter always
+           follows the holdout this build chained.  The searches may also
+           be strided across runs (MMSEQS_SHARD_OFFSET and
+           MMSEQS_SHARD_STRIDE: job I of N searches every N-th shard), the
+           removed set written only when every shard's chunk is staged.
+           The e-value is permissive
+           (100) on purpose: the identity and coverage criteria are the
+           filter, and the e-value only decides what MMseqs2 reports.
+  write    uniref50's rows in its own order, minus the removed ids, as
+           <out>/data/NNNNN.parquet: shard_rows rows per shard (the last
+           partial), zstd, row groups of row_group_rows, each shard written
+           to a temp name and moved into place whole, so a rerun resumes at
+           the first missing shard (the summary's rows counts the survivors
+           on disk and the rows this run wrote, so a resumed build reports
+           the total).  Every removed id must match exactly one
+           source row.  While streaming, sample_size removed ids are kept
+           with their sequences in <out>/.work/removed-sample.json for the
+           test to re-search.
+  verify   the output read back from its footers: shards numbered without
+           gaps, the schema exactly uniref50's two columns, every shard but
+           the last exactly shard_rows rows, and the total exactly the
+           source's rows less the removed count.
+
+With limit > 0 only the first limit source shards feed the mmseqs and
+write stages: a developer's dry run, whose test fails on the floors alone.
+Prints the stage report, and writes it to <out>/.work/build-summary.json
+and, when set, to $FLYLOFT_OUT.
+"""
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+NAME = "uniref50-afdb-holdout-filtered"
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+SCHEMA = pa.schema([("sequence_id", pa.string()), ("sequence", pa.string())])
+UNIREF_ID = re.compile(r"^UniRef50_[0-9A-Za-z]+(?:-[0-9]+)?$")
+SEQUENCE = re.compile(r"^[A-Z]+$")
+TOKENIZER_KEY = b"stok.tokenizer"
+EPS = 1e-6
+
+
+def die(message: str) -> None:
+    sys.exit(f"{NAME}: {message}")
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while block := handle.read(1 << 22):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def capture(command) -> str:
+    result = subprocess.run(command, text=True, capture_output=True)
+    if result.returncode != 0:
+        die(f"{' '.join(map(str, command))} failed (exit "
+            f"{result.returncode}): {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def logged(command) -> None:
+    """Run one command with its output streaming to this run's log."""
+    print("$ " + " ".join(map(str, command)), flush=True)
+    result = subprocess.run(command)
+    if result.returncode != 0:
+        die(f"{' '.join(map(str, command))} failed (exit {result.returncode})")
+
+
+def remove(path: Path) -> None:
+    """A chunk's litter, files and the search's scratch directory alike."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def threads() -> int:
+    override = os.environ.get("MMSEQS_THREADS")
+    if override:
+        return int(override)
+    return min(len(os.sched_getaffinity(0)), 64)
+
+
+def sources(work: Path) -> dict:
+    """Stage the two chained datasets; the holdout pulls only its two splits."""
+    record = work / "sources.json"
+    if record.is_file():
+        return json.loads(record.read_text())
+    from huggingface_hub import snapshot_download
+
+    print(f"== sources: pulling uniref50@{params['uniref50_revision']} and "
+          f"afdb-rep-stok-large@{params['holdout_revision']}", flush=True)
+    started = time.monotonic()
+    uniref = Path(snapshot_download(
+        params["uniref50_repository"], repo_type="dataset",
+        revision=params["uniref50_revision"],
+        cache_dir=str(work / "hf-cache"),
+    ))
+    holdout = Path(snapshot_download(
+        params["holdout_repository"], repo_type="dataset",
+        revision=params["holdout_revision"],
+        cache_dir=str(work / "hf-cache"),
+        allow_patterns=["validation/*", "test/*"],
+    ))
+    shards = sorted((uniref / "data").glob("*.parquet"))
+    if len(shards) != params["uniref50_shards"]:
+        die(f"{uniref}: {len(shards)} shards, expected "
+            f"{params['uniref50_shards']}")
+    rows = sum(pq.ParquetFile(shard).metadata.num_rows for shard in shards)
+    if rows != params["uniref50_rows"]:
+        die(f"{uniref}: {rows} rows, expected {params['uniref50_rows']}")
+    splits = {}
+    for split in ("validation", "test"):
+        paths = sorted((holdout / split).glob("*.parquet"))
+        if not paths:
+            die(f"{holdout / split} holds no shards")
+        count = sum(pq.ParquetFile(path).metadata.num_rows for path in paths)
+        if count < params["holdout_floor"]:
+            die(f"{holdout / split}: {count} rows, under the floor "
+                f"{params['holdout_floor']}")
+        schema = pq.read_schema(paths[0])
+        raw = (schema.metadata or {}).get(TOKENIZER_KEY)
+        if raw is None:
+            die(f"{paths[0]}: no stok.tokenizer metadata")
+        identity = json.loads(raw)
+        if identity.get("checkpoint_sha256") != params["checkpoint_sha256"]:
+            die(f"{paths[0]}: tokenizer checkpoint is "
+                f"{identity.get('checkpoint_sha256')!r}, expected "
+                f"{params['checkpoint_sha256']!r}")
+        splits[split] = {"path": str(holdout / split), "shards": len(paths),
+                         "rows": count}
+    record_data = {
+        "uniref50": {
+            "repository": params["uniref50_repository"],
+            "revision": params["uniref50_revision"], "path": str(uniref),
+            "data": str(uniref / "data"), "shards": len(shards), "rows": rows,
+        },
+        "holdout": {
+            "repository": params["holdout_repository"],
+            "revision": params["holdout_revision"],
+            "splits": splits,
+            "rows": splits["validation"]["rows"] + splits["test"]["rows"],
+        },
+        "pulled": datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"),
+        "seconds": round(time.monotonic() - started, 1),
+    }
+    record.write_text(json.dumps(record_data, indent=2) + "\n")
+    return record_data
+
+
+def holdout_fasta(record: dict, work: Path) -> dict:
+    """The validation and test proteins as one FASTA, ids checked unique."""
+    marker = work / "holdout.json"
+    if marker.is_file():
+        return json.loads(marker.read_text())
+    print("== holdout: writing the validation and test sequences", flush=True)
+    fasta = work / "holdout.fasta"
+    seen, count = set(), 0
+    with fasta.open("w") as handle:
+        for split in ("validation", "test"):
+            for shard in sorted(Path(record["holdout"]["splits"][split]
+                                     ["path"]).glob("*.parquet")):
+                for batch in pq.ParquetFile(shard).iter_batches(
+                    batch_size=1024, columns=["sequence_id", "sequence"],
+                ):
+                    for row in batch.to_pylist():
+                        if row["sequence_id"] in seen:
+                            die(f"{row['sequence_id']} appears twice in the "
+                                "holdout splits")
+                        seen.add(row["sequence_id"])
+                        handle.write(f">{row['sequence_id']}\n"
+                                     f"{row['sequence']}\n")
+                        count += 1
+    if count != record["holdout"]["rows"]:
+        die(f"holdout.fasta holds {count} sequences, the splits hold "
+            f"{record['holdout']['rows']}")
+    data = {"sequences": count, "fasta": str(fasta), "sha256": sha256(fasta)}
+    marker.write_text(json.dumps(data, indent=2) + "\n")
+    return data
+
+
+def write_chunk_fasta(shard: Path, fasta: Path) -> None:
+    """One uniref50 shard's rows as a target FASTA, streamed."""
+    with fasta.open("w") as handle:
+        for batch in pq.ParquetFile(shard).iter_batches(
+            batch_size=65536, columns=["sequence_id", "sequence"],
+        ):
+            for row in batch.to_pylist():
+                handle.write(f">{row['sequence_id']}\n{row['sequence']}\n")
+
+
+def search_flags(threads: int) -> list[str]:
+    return [
+        "--min-seq-id", str(params["min_seq_id"]),
+        "-c", str(params["coverage"]),
+        "--cov-mode", str(params["cov_mode"]),
+        "-s", str(params["sensitivity"]),
+        "-e", str(params["evalue"]),
+        "--max-seqs", str(params["max_seqs"]),
+        "--threads", str(threads),
+    ]
+
+
+def mmseqs(work: Path, shards: list[Path], holdout: dict) -> dict:
+    """The removed ids: every uniref50 entry a holdout protein hits.
+
+    Staged state is trusted only when it names this build's holdout: the
+    chunks record the sha256 of the holdout fasta they were searched from
+    (.work/mmseqs/holdout.sha256, and in parameters.json), and a mismatch --
+    a re-drawn split, a different chained version -- wipes the staged
+    search so it runs again against the holdout this build actually
+    chained.  The searches may be strided across runs
+    (MMSEQS_SHARD_OFFSET and MMSEQS_SHARD_STRIDE: job I of N searches every
+    N-th shard), and the removed set is written only when every shard's
+    chunk is staged, so a strided run never publishes a partial one.
+    """
+    removed = work / "removed-ids.txt"
+    directory = work / "mmseqs"
+    marker = directory / "holdout.sha256"
+    digest = holdout["sha256"]
+    offset = int(os.environ.get("MMSEQS_SHARD_OFFSET") or 0)
+    stride = max(1, int(os.environ.get("MMSEQS_SHARD_STRIDE") or 1))
+    if (removed.is_file() or directory.is_dir()) and (
+            not marker.is_file() or marker.read_text() != digest):
+        print("== mmseqs: the staged search was run against a different "
+              "holdout; wiping it", flush=True)
+        shutil.rmtree(directory, ignore_errors=True)
+        removed.unlink(missing_ok=True)
+    if removed.is_file():
+        ids = removed.read_text().splitlines()
+        return {"removed": len(ids), "resumed": True}
+    chunks = directory / "chunks"
+    chunks.mkdir(parents=True, exist_ok=True)
+    marker.write_text(digest)
+    version = capture(["mmseqs", "version"])
+    workers = threads()
+    tag = "" if (offset, stride) == (0, 1) else f".{offset}-{stride}"
+    qdb = directory / f"qdb{tag}"
+    if not (directory / f"qdb{tag}.done").is_file():
+        print(f"== mmseqs: createdb of the holdout queries ({workers} "
+              "threads)", flush=True)
+        logged(["mmseqs", "createdb", str(work / "holdout.fasta"), str(qdb)])
+        (directory / f"qdb{tag}.done").write_text("")
+    print(f"== mmseqs: {len(shards)} shard searches (offset {offset}, "
+          f"stride {stride}), MMseqs2 {version}, "
+          f"MMSEQS_THREADS={workers}", flush=True)
+    for index, shard in enumerate(shards):
+        if (index - offset) % stride:
+            continue
+        ids_file = chunks / f"{index:05d}.ids"
+        if ids_file.is_file():
+            continue
+        started = time.monotonic()
+        stem = f"chunk-{index:05d}"
+        # A restart mid-chunk leaves fasta/db/tsv/tmp litter behind: it
+        # all goes.
+        for stale in directory.glob(f"{stem}.*"):
+            remove(stale)
+        fasta = directory / f"{stem}.fasta"
+        tdb = directory / f"{stem}.tdb"
+        rdb = directory / f"{stem}.rdb"
+        tsv = directory / f"{stem}.m8"
+        tmp = directory / f"{stem}.tmp"
+        write_chunk_fasta(shard, fasta)
+        logged(["mmseqs", "createdb", str(fasta), str(tdb)])
+        # mmseqs search takes four paths: query, target, result, and the
+        # scratch directory it unfolds its databases into.
+        tmp.mkdir(parents=True, exist_ok=True)
+        logged(["mmseqs", "search", str(qdb), str(tdb), str(rdb), str(tmp),
+                *search_flags(workers)])
+        logged(["mmseqs", "convertalis", str(qdb), str(tdb), str(rdb),
+                str(tsv), "--format-output",
+                "query,target,pident,qcov,tcov"])
+        hits = set()
+        for line in tsv.read_text().splitlines():
+            if not line.strip():
+                continue
+            query, target, pident, qcov, tcov = line.split("\t")
+            if (float(pident) < 100 * params["min_seq_id"] - EPS
+                    or float(qcov) < params["coverage"] - EPS
+                    or float(tcov) < params["coverage"] - EPS):
+                die(f"{tsv}: the alignment {query} -> {target} "
+                    f"(pident {pident}, qcov {qcov}, tcov {tcov}) is under "
+                    "the filter's thresholds, but the search reported it")
+            hits.add(target)
+        part = chunks / f"{index:05d}.ids.part"
+        part.write_text("".join(f"{hit}\n" for hit in sorted(hits)))
+        part.replace(ids_file)
+        seconds = round(time.monotonic() - started, 1)
+        timing = chunks / f"{index:05d}.json.part"
+        timing.write_text(json.dumps(
+            {"shard": shard.name, "seconds": seconds, "hits": len(hits)},
+            sort_keys=True) + "\n")
+        timing.replace(chunks / f"{index:05d}.json")
+        for path in directory.glob(f"{stem}.*"):
+            remove(path)
+        print(f"== mmseqs: {shard.name} done in {seconds}s, "
+              f"{len(hits)} hits", flush=True)
+    done = sorted(chunks.glob("*.ids"))
+    if len(done) < len(shards):
+        print(f"== mmseqs: {len(done)} of {len(shards)} chunks staged; "
+              "the removed set waits for the rest", flush=True)
+        return {"chunks_done": len(done), "chunks": len(shards),
+                "resumed": False}
+    per_chunk = [json.loads(path.read_text())
+                 for path in sorted(chunks.glob("*.json"))]
+    part = directory / "parameters.json.part"
+    part.write_text(json.dumps({
+        "mmseqs2_version": version, "threads": workers,
+        "min_seq_id": params["min_seq_id"], "coverage": params["coverage"],
+        "cov_mode": params["cov_mode"], "sensitivity": params["sensitivity"],
+        "evalue": params["evalue"], "max_seqs": params["max_seqs"],
+        "holdout_sha256": digest, "holdout_sequences": holdout.get("sequences"),
+        "direction": "query = afdb-rep-stok-large validation+test "
+                     "sequences; target = uniref50, one DB per source shard",
+        "per_chunk": per_chunk,
+    }, indent=2) + "\n")
+    part.replace(directory / "parameters.json")
+    hits = set()
+    for ids_file in sorted(chunks.glob("*.ids")):
+        hits.update(line for line in ids_file.read_text().splitlines()
+                    if line)
+    if not hits:
+        die("the search removed nothing: every holdout protein has at least "
+            "itself or a close homolog among uniref50's 41M entries, so an "
+            "empty hit set means the search never really ran")
+    part = work / "removed-ids.txt.part"
+    part.write_text("".join(f"{hit}\n" for hit in sorted(hits)))
+    part.replace(removed)
+    return {"removed": len(hits), "resumed": False, "chunks": len(shards),
+            "mmseqs2_version": version}
+
+
+def write_data(out: Path, work: Path, shards: list[Path],
+               removed: list[str]) -> dict:
+    """uniref50's rows in order minus the removed ids, 1M-row zstd shards."""
+    data = out / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    existing = 0
+    while (data / f"{existing:05d}.parquet").is_file():
+        existing += 1
+    removed_set = set(removed)
+    step = max(1, len(removed) // params["sample_size"])
+    sampled = set(removed[::step][:params["sample_size"]])
+    skip = existing * params["shard_rows"]
+    matched, written, skipped = 0, 0, 0
+    index, ids, seqs = existing, [], []
+    sample = []
+    for shard in shards:
+        for batch in pq.ParquetFile(shard).iter_batches(
+            batch_size=65536, columns=["sequence_id", "sequence"],
+        ):
+            for row in batch.to_pylist():
+                if row["sequence_id"] in removed_set:
+                    matched += 1
+                    if row["sequence_id"] in sampled:
+                        sample.append({"sequence_id": row["sequence_id"],
+                                       "sequence": row["sequence"]})
+                    continue
+                if skip:
+                    skip -= 1
+                    skipped += 1
+                    continue
+                ids.append(row["sequence_id"])
+                seqs.append(row["sequence"])
+                if len(ids) == params["shard_rows"]:
+                    write_shard(data, index, ids, seqs)
+                    index, ids, seqs = index + 1, [], []
+                    written += params["shard_rows"]
+    if ids:
+        write_shard(data, index, ids, seqs)
+        written += len(ids)
+    if matched != len(removed):
+        die(f"{matched} of {len(removed)} removed ids matched source rows: "
+            "every removed id must come from exactly one uniref50 row")
+    if sample:
+        (work / "removed-sample.json").write_text(
+            json.dumps(sample, indent=2) + "\n")
+    return {"shards": index + (1 if ids else 0),
+            "rows": written + skipped, "removed_sampled": len(sample)}
+
+
+def write_shard(data: Path, index: int, ids: list[str],
+                seqs: list[str]) -> None:
+    """Shard N whole or not at all: written under .work/ then moved."""
+    part = data.parent / ".work" / "shard.part"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table({"sequence_id": ids, "sequence": seqs}, schema=SCHEMA),
+        part, row_group_size=params["row_group_rows"], compression="zstd",
+    )
+    os.replace(part, data / f"{index:05d}.parquet")
+
+
+def verify(out: Path, source_rows: int, removed: int) -> dict:
+    """The output read back from its footers."""
+    data = out / "data"
+    shards = []
+    index = 0
+    while (data / f"{index:05d}.parquet").is_file():
+        shards.append(data / f"{index:05d}.parquet")
+        index += 1
+    if not shards:
+        die(f"{data}: no shards")
+    rows = 0
+    for position, shard in enumerate(shards):
+        footer = pq.ParquetFile(shard)
+        if [(f.name, f.type) for f in footer.schema_arrow] != [
+            (f.name, f.type) for f in SCHEMA
+        ]:
+            die(f"{shard}: schema is {footer.schema_arrow.names}, expected "
+                "sequence_id, sequence")
+        expected = (params["shard_rows"]
+                    if position < len(shards) - 1 else None)
+        if expected is not None and footer.metadata.num_rows != expected:
+            die(f"{shard}: {footer.metadata.num_rows} rows, expected "
+                f"{expected} (only the last shard is partial)")
+        rows += footer.metadata.num_rows
+    if rows != source_rows - removed:
+        die(f"{data}: {rows} rows, expected the source's {source_rows} less "
+            f"{removed} removed")
+    return {"shards": len(shards), "rows": rows}
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        die("usage: recipe/build <out>")
+    out = Path(sys.argv[1]).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    work = out / ".work"
+    work.mkdir(parents=True, exist_ok=True)
+    limit = params.get("limit", 0) or 0
+    record = sources(work)
+    shards = sorted(Path(record["uniref50"]["data"]).glob("*.parquet"))
+    source_rows = (sum(pq.ParquetFile(shard).metadata.num_rows
+                       for shard in shards[:limit]) if limit
+                   else record["uniref50"]["rows"])
+    shards = shards[:limit] if limit else shards
+    holdout = holdout_fasta(record, work)
+    removed = mmseqs(work, shards, holdout)
+    ids = (work / "removed-ids.txt").read_text().splitlines()
+    written = write_data(out, work, shards, ids)
+    summary = {
+        "name": NAME,
+        "version_params": {
+            key: params[key] for key in (
+                "uniref50_repository", "uniref50_revision",
+                "holdout_repository", "holdout_revision", "min_seq_id",
+                "coverage", "cov_mode", "sensitivity", "evalue", "max_seqs",
+                "shard_rows", "row_group_rows", "limit",
+            )
+        },
+        "sources": record, "holdout": holdout, "mmseqs": removed,
+        "write": written, "verify": verify(out, source_rows, len(ids)),
+    }
+    print(json.dumps(summary, indent=2))
+    (work / "build-summary.json").write_text(json.dumps(summary, indent=2)
+                                             + "\n")
+    flyloft_out = os.environ.get("FLYLOFT_OUT")
+    if flyloft_out and Path(flyloft_out).is_dir():
+        Path(flyloft_out, "build-summary.json").write_text(
+            json.dumps(summary, indent=2) + "\n")
+    print(f"{NAME}: {summary['verify']['rows']} rows of "
+          f"{record['uniref50']['rows']} ({summary['mmseqs']['removed']} "
+          "removed as holdout homologs)")
+
+
+if __name__ == "__main__":
+    main()

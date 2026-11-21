@@ -1,0 +1,278 @@
+#!/usr/bin/env -S python3 -I
+"""recipe/test <out>: exit 0 iff <out> holds a version of uniref50-afdb-holdout-filtered.
+
+From the shards' parquet footers and sampled rows, in datascience@1.2.0:
+
+  layout    data/ holds shards numbered 00000.parquet onward without a gap.
+  schema    exactly uniref50's two columns: sequence_id and sequence, strings.
+  rows      the total is over the floor and never over uniref50's own
+            41,243,524; every shard but the last holds exactly 1,000,000.
+  rows      sampled rows: every sequence_id is a UniRef50_ entry id --
+            UniRef50_ then the accession, optionally UniRef's -N
+            disambiguation suffix (UniRef50_O15382-2: two clusters whose
+            representatives share an accession) -- and every sequence is
+            uppercase letters only.
+
+When the build's <out>/.work is present (the cook, and any rerun where the
+recipe staged it), the filter itself is judged, not just the layout:
+
+  removed   .work/removed-ids.txt: ids sorted, unique, each a UniRef50_
+            entry id (the -N suffix included), and rows + removed exactly
+            uniref50's 41,243,524.
+  split     the output's ids streamed against the source's, in order: every
+            output row is a source row, every skipped source row is removed,
+            and no removed id is among the rows -- the output is exactly
+            uniref50 minus the removed set.
+  re-search the sampled removed ids from .work/removed-sample.json, each with
+            its sequence: every one must again hit a holdout protein under
+            the filter's own MMseqs2 flags (a query DB rebuilt from
+            .work/holdout.fasta, a target DB of the sample), so the removals
+            are real homologs of held-out proteins, not a plumbing accident.
+
+One line per failure, naming the check and the first offender; a line per
+check group on success."""
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+import pyarrow.parquet as pq
+
+NAME = "uniref50-afdb-holdout-filtered"
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+UNIREF_ID = re.compile(r"^UniRef50_[0-9A-Za-z]+(?:-[0-9]+)?$")
+SEQUENCE = re.compile(r"^[A-Z]+$")
+failures = []
+
+
+def fail(check: str, detail: str) -> None:
+    failures.append(f"{NAME}: {check}: {detail}")
+
+
+def rows_of(paths):
+    total = 0
+    for path in paths:
+        total += pq.ParquetFile(path).metadata.num_rows
+    return total
+
+
+def search_flags() -> list[str]:
+    return [
+        "--min-seq-id", str(params["min_seq_id"]),
+        "-c", str(params["coverage"]),
+        "--cov-mode", str(params["cov_mode"]),
+        "-s", str(params["sensitivity"]),
+        "-e", str(params["evalue"]),
+        "--max-seqs", str(params["max_seqs"]),
+        "--threads", "4",
+    ]
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        sys.exit("usage: recipe/test <out>")
+    out = Path(sys.argv[1]).resolve()
+    work = out / ".work"
+
+    shards, index = [], 0
+    while (out / "data" / f"{index:05d}.parquet").is_file():
+        shards.append(out / "data" / f"{index:05d}.parquet")
+        index += 1
+    if not shards:
+        fail("layout", f"{out / 'data'} holds no shards")
+        for line in failures:
+            print(line)
+        sys.exit(f"{NAME}: cannot test further without shards")
+    import pyarrow as pa
+
+    schema = [("sequence_id", pa.string()), ("sequence", pa.string())]
+    for position, path in enumerate(shards):
+        footer = pq.ParquetFile(path)
+        if [(f.name, f.type) for f in footer.schema_arrow] != schema:
+            fail("schema", f"{path}: {footer.schema_arrow.names} is not "
+                           "sequence_id, sequence")
+        if position < len(shards) - 1 and \
+                footer.metadata.num_rows != params["shard_rows"]:
+            fail("rows", f"{path}: {footer.metadata.num_rows} rows, expected "
+                         f"{params['shard_rows']} (only the last shard is "
+                         "partial)")
+    rows = rows_of(shards)
+    if rows < params["rows_floor"]:
+        fail("rows", f"{rows} rows is under the floor {params['rows_floor']}")
+    if params.get("limit", 0):
+        fail("rows", f"limit {params['limit']}: a dry run is never a version")
+    elif rows > params["uniref50_rows"]:
+        fail("rows", f"{rows} rows is over uniref50's own "
+                     f"{params['uniref50_rows']}")
+
+    for path in (shards[0], shards[len(shards) // 2], shards[-1]):
+        footer = pq.ParquetFile(path)
+        groups = footer.num_row_groups
+        table = read_ends(footer, groups)
+        for row in sampled_rows(table):
+            if not UNIREF_ID.match(row["sequence_id"] or ""):
+                fail("rows", f"{path.name}:{row['sequence_id']}: id matches "
+                             "no UniRef50_ entry")
+            if not SEQUENCE.match(row["sequence"] or ""):
+                fail("rows", f"{path.name}:{row['sequence_id']}: sequence is "
+                             "not uppercase letters")
+    print(f"ok: {len(shards)} shards, {rows} rows, schemas, sampled rows "
+          "whole")
+
+    removed_file = work / "removed-ids.txt"
+    if not work.is_dir() or not removed_file.is_file():
+        print("note: no staged .work to judge the filter against (the Hub "
+              "copy); the layout, schema, floors and samples above are the "
+              "whole test here")
+        for line in failures:
+            print(line)
+        if failures:
+            sys.exit(f"{NAME}: {len(failures)} failures")
+        return
+
+    removed = removed_file.read_text().splitlines()
+    if removed != sorted(set(removed)):
+        fail("removed", "removed-ids.txt is not sorted and unique")
+        removed = sorted(set(removed))
+    for sequence_id in removed:
+        if not UNIREF_ID.match(sequence_id):
+            fail("removed", f"{sequence_id} matches no UniRef50_ entry")
+            break
+    if not params.get("limit", 0) and \
+            rows + len(removed) != params["uniref50_rows"]:
+        fail("removed", f"{rows} rows + {len(removed)} removed is not "
+                        f"uniref50's {params['uniref50_rows']}")
+
+    # The output is exactly uniref50 minus the removed set, in order.
+    sources = work / "sources.json"
+    if sources.is_file() and not params.get("limit", 0):
+        source_dir = json.loads(sources.read_text())["uniref50"]["data"]
+        removed_set = set(removed)
+        source_paths = sorted(Path(source_dir).glob("*.parquet"))
+        source_rows = rows_of(source_paths)
+        if source_rows == params["uniref50_rows"]:
+            skipped = 0
+            cursor = iter_ids(shards)
+            expected = next(cursor, None)
+            try:
+                for source_id in iter_ids(source_paths):
+                    if source_id == expected:
+                        if source_id in removed_set:
+                            fail("split", f"{source_id} is a row and removed")
+                        expected = next(cursor, None)
+                    elif source_id in removed_set:
+                        skipped += 1
+                    else:
+                        fail("split", f"{source_id} is neither a row nor "
+                                      "removed")
+                        break
+            except OSError as error:
+                fail("split", f"reading the source failed: {error}")
+            if expected is not None:
+                fail("split", "the source ended before the output did")
+            if not failures and skipped != len(removed):
+                fail("split", f"{skipped} source rows skipped, "
+                              f"{len(removed)} removed")
+            if not failures:
+                print(f"ok: the output is uniref50 minus {len(removed)} "
+                      "removed ids, in the source's order")
+
+    sample_file = work / "removed-sample.json"
+    if not sample_file.is_file():
+        fail("re-search", f"{sample_file} is missing")
+    else:
+        sample = json.loads(sample_file.read_text())
+        if len(sample) != params["sample_size"]:
+            fail("re-search", f"{len(sample)} sampled removed ids, expected "
+                             f"{params['sample_size']}")
+        re_search(work, sample)
+
+    for line in failures:
+        print(line)
+    if failures:
+        sys.exit(f"{NAME}: {len(failures)} failures")
+    print(f"ok: {rows} rows + {len(removed)} removed == uniref50's "
+          f"{params['uniref50_rows']}")
+
+
+def read_ends(footer, groups):
+    import pyarrow as pa
+
+    return pa.concat_tables([footer.read_row_group(0),
+                             footer.read_row_group(groups - 1)])
+
+
+def sampled_rows(table):
+    return [table.slice(min(i, table.num_rows - 1), 1).to_pylist()[0]
+            for i in range(0, table.num_rows,
+                           max(1, table.num_rows // 6))][:6]
+
+
+def iter_ids(paths):
+    for path in paths:
+        for batch in pq.ParquetFile(path).iter_batches(
+            batch_size=65536, columns=["sequence_id"],
+        ):
+            yield from batch.column(0).to_pylist()
+
+
+def re_search(work: Path, sample) -> None:
+    """Every sampled removed id must again hit a holdout protein."""
+    fasta = work / "holdout.fasta"
+    if not fasta.is_file():
+        fail("re-search", f"{fasta} is missing")
+        return
+    with tempfile.TemporaryDirectory(prefix="holdout-test-") as scratch:
+        scratch = Path(scratch)
+        targets = scratch / "targets.fasta"
+        with targets.open("w") as handle:
+            for entry in sample:
+                handle.write(f">{entry['sequence_id']}\n"
+                             f"{entry['sequence']}\n")
+        def run(*args):
+            result = subprocess.run(["mmseqs", *args], text=True,
+                                    capture_output=True)
+            if result.returncode != 0:
+                fail("re-search", f"mmseqs {' '.join(args[:2])} failed: "
+                                 f"{result.stderr.strip()[-200:]}")
+                return False
+            return True
+        if not run("createdb", str(fasta), str(scratch / "qdb")):
+            return
+        if not run("createdb", str(targets), str(scratch / "tdb")):
+            return
+        # search takes four paths: query, target, result, scratch.
+        if not run("search", str(scratch / "qdb"), str(scratch / "tdb"),
+                   str(scratch / "rdb"), str(scratch / "tmp"),
+                   *search_flags()):
+            return
+        tsv = scratch / "hits.m8"
+        result = subprocess.run(
+            ["mmseqs", "convertalis", str(scratch / "qdb"),
+             str(scratch / "tdb"), str(scratch / "rdb"), str(tsv),
+             "--format-output", "query,target,pident,qcov,tcov"],
+            text=True, capture_output=True,
+        )
+        if result.returncode != 0:
+            fail("re-search", f"mmseqs convertalis failed: "
+                              f"{result.stderr.strip()[-200:]}")
+            return
+        hit = set()
+        for line in tsv.read_text().splitlines():
+            if line.strip():
+                hit.add(line.split("\t")[1])
+        for entry in sample:
+            if entry["sequence_id"] not in hit:
+                fail("re-search", f"{entry['sequence_id']} was removed but "
+                                  "no holdout protein aligns to it at the "
+                                  "filter's thresholds")
+        if not failures:
+            print(f"ok: every sampled removed id re-hits a holdout protein "
+                  f"({len(sample)} re-searched)")
+
+
+if __name__ == "__main__":
+    main()
