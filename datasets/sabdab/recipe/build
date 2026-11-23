@@ -127,8 +127,23 @@ def assemble(source, config, work, dest):
                 if not member.isfile():
                     continue
                 if path.name.lower() == "sabdab_summary.csv":
-                    if have_summary or inventory(tar.extractfile(member).read()) != rows:
-                        raise CropArchiveError("Archive and source inventories differ")
+                    archive_rows = inventory(tar.extractfile(member).read())
+                    if have_summary or archive_rows != rows:
+                        only_archive = sorted(set(archive_rows) - set(rows))
+                        only_summary = sorted(set(rows) - set(archive_rows))
+                        differing = {}
+                        for key in sorted(set(archive_rows) & set(rows)):
+                            fields = {name: [rows[key].get(name), archive_rows[key].get(name)]
+                                      for name in set(rows[key]) | set(archive_rows[key])
+                                      if rows[key].get(name) != archive_rows[key].get(name)}
+                            if fields:
+                                differing[key] = fields
+                                if len(differing) == 3:
+                                    break
+                        raise CropArchiveError(json.dumps(
+                            {"error": "Archive and source inventories differ",
+                             "only_archive": only_archive[:20], "only_summary": only_summary[:20],
+                             "differing_examples": differing}, default=str))
                     have_summary = True
                     continue
                 if path.parent.name != "instance_structures" or not path.name.endswith(".cif.gz"):
