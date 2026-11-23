@@ -128,6 +128,10 @@ def assemble(source, config, work, dest):
                     continue
                 if path.name.lower() == "sabdab_summary.csv":
                     archive_rows = inventory(tar.extractfile(member).read())
+                    # This path is export bookkeeping, not a SAbDab2 summary annotation.
+                    archive_rows = {key: {name: value for name, value in row.items()
+                                          if name != "filename_in_archive"}
+                                    for key, row in archive_rows.items()}
                     if have_summary or archive_rows != rows:
                         only_archive = sorted(set(archive_rows) - set(rows))
                         only_summary = sorted(set(rows) - set(archive_rows))
