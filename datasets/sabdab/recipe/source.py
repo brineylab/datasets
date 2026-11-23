@@ -1,5 +1,6 @@
 """SAbDab2's summary and one job-backed, IMGT-numbered instance-crop archive."""
 import hashlib
+import json
 import time
 from urllib.parse import quote
 
