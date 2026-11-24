@@ -183,7 +183,6 @@ def assemble(source, config, work, dest):
                     cif = MMCIF2Dict(io.StringIO(data.decode()))
                     polymer = antibody_chains(cif)
                     pdb = deposition(cif)
-                    kind = path.name.removesuffix(".cif.gz").rsplit("_", 1)[1]
                 except (UnicodeError, KeyError, IndexError, AttributeError, TypeError) as error:
                     raise CropArchiveError(f"Cannot parse instance crop {path}: {error}") from error
                 candidates = [key for key, antibody, chains in crop_instances.get(pdb, [])
@@ -208,8 +207,6 @@ def assemble(source, config, work, dest):
                     raise CropArchiveError(f"Missing annotated antigen chains in {key}: {path}")
                 if not has_antigen and not antibody <= polymer:
                     raise CropArchiveError(f"Missing antibody chains in {key}: {path}")
-                if kind.rstrip("0123456789") not in ({"ab", "abag"} if not has_antigen else {"abag"}):
-                    raise CropArchiveError(f"Incorrect antigen download option for {key}: {path}")
                 flags = {"any"}
                 if row["PDB_ID"] == repeated and repeated_samples < 2:
                     repeated_samples += 1
