@@ -1,0 +1,150 @@
+#!/usr/bin/env -S python3 -I
+"""Build the six EPAM PCP corpora and two canonical whole-family subsamples.
+
+Only Zenodo record 17353498's pcps.tar.gz is fetched. Every source digest is verified
+before conversion; every corpus is compared with its source during conversion.
+A verified archive is retained under <out>/.work/ for rerun/resume.
+"""
+import hashlib
+import json
+import shutil
+import sys
+import tarfile
+import tomllib
+import urllib.request
+from pathlib import Path
+
+import duckdb
+import polars as pl
+import pyarrow.parquet as pq
+
+# Existing lab recipes include their local directory on sys.path. Explicitly add it
+# too, so both ordinary invocation and programmatic recipe runners behave identically.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import COLUMNS, CORPORA, NUMERIC, csv_source, subsample
+
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+out = Path(sys.argv[1]).resolve()
+work = out / ".work"
+archive = work / "pcps.tar.gz"
+sources = work / "csv"
+
+# Numeric and boolean cells use EPAM's ordinary CSV representation; all others remain text.
+# The CSV reader maps its ordinary empty-field/NA representation to null without cleaning.
+
+
+def sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def download():
+    work.mkdir(parents=True, exist_ok=True)
+    if archive.is_file() and archive.stat().st_size == params["source_bytes"] and sha256(archive) == params["source_sha256"]:
+        return
+    part = archive.with_name("pcps.part")
+    request = urllib.request.Request(params["source_url"], headers={"User-Agent": "brineylab-datasets"})
+    with urllib.request.urlopen(request) as response, part.open("wb") as stream:
+        shutil.copyfileobj(response, stream, length=1 << 22)
+    if part.stat().st_size != params["source_bytes"]:
+        raise ValueError(f"archive has {part.stat().st_size} bytes, not {params['source_bytes']}")
+    if sha256(part) != params["source_sha256"] or hashlib.md5(part.read_bytes()).hexdigest() != params["source_md5"]:
+        raise ValueError("pcps.tar.gz digest differs from the pinned Zenodo deposit")
+    part.replace(archive)
+
+
+def extract():
+    sources.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as tar:
+        members = tar.getmembers()
+        assert len(members) == 10, f"archive has {len(members)} members, not the pinned ten"
+        assert {m.name for m in members if m.isfile()} == {v[0] for v in CORPORA.values()}
+        for name, (member, _, digest) in CORPORA.items():
+            source = sources / name / "source.csv"
+            if source.is_file() and sha256(source) == digest:
+                continue
+            source.parent.mkdir(parents=True, exist_ok=True)
+            with tar.extractfile(member) as stream:
+                data = stream.read()
+            assert hashlib.sha256(data).hexdigest() == digest, f"{name}'s source CSV sha256 differs"
+            source.write_bytes(data)
+
+
+def verify_against_csv(corpus, parquet):
+    """The entire parquet, including row order, equals a fresh typed read of its source CSV."""
+    source = sources / corpus / "source.csv"
+    con = duckdb.connect()
+    comparison = con.read_parquet(str(parquet)).fetch_arrow_table().combine_chunks()
+    expected = csv_source(con, source).fetch_arrow_table().combine_chunks()
+    if comparison.schema != expected.schema or not comparison.equals(expected):
+        for c in COLUMNS:
+            a, b = comparison[c], expected[c]
+            if not a.equals(b):
+                raise ValueError(f"{corpus}/{c}: parquet differs from its source CSV")
+        raise ValueError(f"{corpus}: parquet schema differs from its source CSV")
+    con.close()
+
+
+def main():
+    download()
+    extract()
+    manifest = {
+        "source": {
+            "record": "https://doi.org/10.5281/zenodo.17353498",
+            "file": "pcps.tar.gz", "url": params["source_url"], "pulled": params["pulled"],
+            "bytes": archive.stat().st_size, "sha256": sha256(archive),
+            "md5": hashlib.md5(archive.read_bytes()).hexdigest(),
+        },
+        "conversion": {
+            "container": "CSV to parquet, without filtering, cleaning or reordering",
+            "columns": COLUMNS,
+            "duckdb_csv_reader": {"header": True, "types": NUMERIC,
+                                  "all_other_columns": "VARCHAR", "csv_empty_or_na_cell_as_null": True},
+            "verification": "Every value in every ordered row and the parsed datatype equals a fresh typed read of its source CSV.",
+        },
+        "subsample": {
+            "seed": params["seed"], "target_pairs": params["subsample_target"],
+            "family_key": "(sample_id, family)",
+            "order": "Distinct families sorted by the lowercase 64-character hexadecimal digest sha256(seed + ':' + len(sample_id) + ':' + sample_id + len(family) + ':' + family), with decimal UTF-8 character lengths. Ordinary lexicographic sorting of the hex strings is used. The build rejects an actual digest collision.",
+            "accumulation": "Include consecutive whole families while fewer than target_pairs rows are accumulated; include the crossing family whole and stop",
+            "row_order": "Original corpus row order",
+            "corpora": {},
+        },
+        "corpora": {},
+        "files": {},
+    }
+    for corpus, (member, expected_rows, digest) in CORPORA.items():
+        path = out / corpus / "pcps.parquet"
+        if not path.is_file() or pq.ParquetFile(path).metadata.num_rows != expected_rows:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name("pcps.parquet.part")
+            con = duckdb.connect()
+            table = csv_source(con, sources / corpus / "source.csv").fetch_arrow_table()
+            pq.write_table(table, tmp, compression="zstd")
+            con.close()
+            tmp.replace(path)
+            verify_against_csv(corpus, path)
+        table = pl.read_parquet(path)
+        assert table.columns == COLUMNS
+        assert table.height == expected_rows, f"{corpus} has {table.height} rows, not {expected_rows}"
+        manifest["corpora"][corpus] = {"source_member": member, "source_rows": expected_rows, "source_sha256": digest}
+        manifest["files"][f"{corpus}/pcps.parquet"] = {"rows": table.height, "sha256": sha256(path)}
+        print(f"corpus {corpus}: {table.height} rows, source sha256 {digest}, file sha256 {sha256(path)}")
+        if corpus in params["subsample_corpora"]:
+            sample, total, overshoot, families = subsample(table, params["seed"], params["subsample_target"])
+            sample_path = path.with_name("subsample-20k.parquet")
+            sample.write_parquet(sample_path, compression="zstd")
+            assert pl.read_parquet(sample_path).equals(sample)
+            manifest["subsample"]["corpora"][corpus] = {"rows": total, "families": families,
+                                                        "target": params["subsample_target"], "overshoot": overshoot}
+            manifest["files"][f"{corpus}/subsample-20k.parquet"] = {"rows": total, "sha256": sha256(sample_path)}
+            print(f"subsample {corpus}: {total} rows, {families} families, target {params['subsample_target']}, "
+                  f"overshoot {overshoot}, seed {params['seed']}, family key (sample_id, family), file sha256 {sha256(sample_path)}")
+    assert sum(c["rows"] for k, c in manifest["files"].items() if k.endswith("/pcps.parquet")) == 743080
+    part = out / "provenance.json.part"
+    part.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    part.replace(out / "provenance.json")
+
+
+if __name__ == "__main__":
+    main()

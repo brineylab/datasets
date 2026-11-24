@@ -1,0 +1,8 @@
+pulled = "2026-11-24"
+source_url = "https://zenodo.org/api/records/17353498/files/pcps.tar.gz/content"
+source_bytes = 54015727
+source_md5 = "c9f5a5798e4a387b14a66a27f97c1acf"
+source_sha256 = "73f94dff6912b1e4e6872c9c952e4c3a10c06c4a209e47a765dbc34f5bea532c"
+seed = 20261124
+subsample_target = 20000
+subsample_corpora = ["tang", "wyatt"]

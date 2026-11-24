@@ -1,0 +1,90 @@
+#!/usr/bin/env -S python3 -I
+"""Test a complete epam-pcps output and redraw both family subsamples independently."""
+import hashlib
+import json
+import sys
+import tomllib
+from pathlib import Path
+
+import polars as pl
+
+from common import COLUMNS, CORPORA, NUMERIC, subsample
+
+params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
+out = Path(sys.argv[1])
+problems = []
+total = 0
+try:
+    provenance = json.loads((out / "provenance.json").read_text(encoding="utf-8"))
+    if provenance["source"]["sha256"] != params["source_sha256"]:
+        problems.append("provenance: source sha256 differs from the pinned archive")
+    if provenance["subsample"]["seed"] != params["seed"] or set(provenance["subsample"]["corpora"]) != set(params["subsample_corpora"]):
+        problems.append("provenance: subsample seed or corpora differ from the recipe")
+    for corpus, (member, expected, source_digest) in CORPORA.items():
+        declared = provenance["corpora"][corpus]
+        if (declared["source_member"], declared["source_rows"], declared["source_sha256"]) != (member, expected, source_digest):
+            problems.append(f"provenance: {corpus} differs from the pinned source CSV")
+except (FileNotFoundError, KeyError, TypeError, json.JSONDecodeError) as error:
+    problems.append(f"provenance: {error}")
+    provenance = {"files": {}}
+for corpus, (_, expected, _) in CORPORA.items():
+    path = out / corpus / "pcps.parquet"
+    if not path.is_file():
+        problems.append(f"files: {corpus}/pcps.parquet is missing")
+        continue
+    table = pl.read_parquet(path)
+    total += table.height
+    if table.columns != COLUMNS:
+        problems.append(f"columns: {corpus} has {table.columns}")
+    if table.height != expected:
+        problems.append(f"rows: {corpus} has {table.height}, not {expected}")
+    for column, sqltype in NUMERIC.items():
+        expected_dtype = {"DOUBLE": pl.Float64, "BIGINT": pl.Int64, "BOOLEAN": pl.Boolean}[sqltype]
+        if table[column].dtype != expected_dtype:
+            problems.append(f"types: {corpus}/{column} is {table[column].dtype}, not {expected_dtype}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if provenance.get("files", {}).get(f"{corpus}/pcps.parquet") != {"rows": table.height, "sha256": digest}:
+        problems.append(f"provenance: {corpus}/pcps.parquet's row count or sha256 differs")
+    print(f"{corpus}/pcps.parquet {table.height} rows sha256 {digest}")
+    if corpus not in params["subsample_corpora"]:
+        continue
+    sample_path = out / corpus / "subsample-20k.parquet"
+    if not sample_path.is_file():
+        problems.append(f"files: {corpus}/subsample-20k.parquet is missing")
+        continue
+    sample = pl.read_parquet(sample_path)
+    rebuilt, n, overshoot, families = subsample(table, params["seed"], params["subsample_target"])
+    if sample.columns != COLUMNS or not sample.equals(rebuilt):
+        problems.append(f"subsample: {corpus} differs from the independent canonical redraw")
+    if sample.height != n or n < params["subsample_target"]:
+        problems.append(f"subsample rows: {corpus} has {sample.height}, redraw has {n}")
+    # Check every family row directly against the full corpus, without trusting the redraw result.
+    chosen = {}
+    for row in sample.group_by("sample_id", "family").len().iter_rows(named=True):
+        chosen[(row["sample_id"], row["family"])] = row["len"]
+    whole = {(r["sample_id"], r["family"]): r["len"]
+             for r in table.group_by("sample_id", "family").len().iter_rows(named=True)}
+    if any(whole[key] != count for key, count in chosen.items()):
+        problems.append(f"family integrity: {corpus}/subsample-20k.parquet has a partial family")
+    digest = hashlib.sha256(sample_path.read_bytes()).hexdigest()
+    if provenance.get("files", {}).get(f"{corpus}/subsample-20k.parquet") != {"rows": n, "sha256": digest}:
+        problems.append(f"provenance: {corpus}/subsample-20k.parquet's row count or sha256 differs")
+    if provenance["subsample"]["corpora"].get(corpus) != {"rows": n, "families": families,
+                                                         "target": params["subsample_target"], "overshoot": overshoot}:
+        problems.append(f"provenance: {corpus}'s measured subsample differs")
+    if params["seed"] == 20261124 and corpus == "tang" and table.height == 505915:
+        if table.group_by("sample_id", "family").len().height != 142857:
+            problems.append("families: tang does not have 142857 (sample_id, family) keys")
+        if table.group_by("family").len().height != 43692:
+            problems.append("families: tang's family-only count is not 43692")
+    if params["seed"] == 20261124 and corpus == "wyatt" and table.height == 193601:
+        if table.group_by("sample_id", "family").len().height != 50692:
+            problems.append("families: wyatt does not have 50692 (sample_id, family) keys")
+        if table.group_by("family").len().height != 49206:
+            problems.append("families: wyatt's family-only count is not 49206")
+    print(f"{corpus}/subsample-20k.parquet {n} rows {families} families overshoot {overshoot} "
+          f"sha256 {digest}")
+if total != 743080:
+    problems.append(f"count: the six corpora total {total}, not 743080")
+print("\n".join(problems) or "ok")
+sys.exit(1 if problems else 0)
