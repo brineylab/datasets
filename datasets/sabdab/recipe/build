@@ -135,8 +135,7 @@ def assemble(source, config, work, dest):
     crop_instances = {}
     for key, row in rows.items():
         antibody = {chain for chain in (row["Hchain"], row["Lchain"]) if chain}
-        antigens = set((row["antigen_chain"] or "").split("|")) - {""}
-        crop_instances.setdefault(row["PDB_ID"].lower(), []).append((key, antibody, antibody | antigens))
+        crop_instances.setdefault(row["PDB_ID"].lower(), []).append((key, antibody))
     counts = Counter(r["PDB_ID"] for r in rows.values())
     samples, categories, shards = {}, set(), []
     repeated = next((pdb for pdb, n in counts.items() if n > 1), None)
@@ -193,10 +192,10 @@ def assemble(source, config, work, dest):
                 # Identical crops can carry different instance identities (e.g. reciprocal
                 # antibody/antigen pairings), so chain sets alone are not always sufficient.
                 # The archive summary's explicit mapping disambiguates them; mmCIF content
-                # still validates every exact-case antibody and antigen chain assignment.
-                candidates = [key for key, antibody, chains in crop_instances.get(pdb, [])
-                              if antibody <= polymer and polymer <= chains
-                              and archive_files[key] == str(path)]
+                # still validates the required exact-case antibody assignment. A source crop
+                # can contain additional polymer chains beyond its summary's annotations.
+                candidates = [key for key, antibody in crop_instances.get(pdb, [])
+                              if antibody <= polymer and archive_files[key] == str(path)]
                 if len(candidates) != 1:
                     raise CropArchiveError(json.dumps({
                         "error": "A crop does not match exactly one instance by its source archive mapping and mmCIF chain IDs",

@@ -136,6 +136,15 @@ class SnapshotTest(unittest.TestCase):
             rows = pq.read_table(root / "data").to_pylist()
             self.assertTrue(all("_ab" in row["archive_filename"] and "_abag" not in row["archive_filename"] for row in rows))
 
+    def test_source_crop_may_contain_additional_polymer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = Export()
+            first = next(iter(source.files))
+            source.files[first] += b"? ?\r\n"
+            self.capture(root, source)
+            verify(root)
+
     def test_inconsistent_exports(self):
         for case, message in [("duplicate", "duplicate source identifier"),
                               ("missing", "Missing archive"), ("ambiguous", "exactly one instance"),

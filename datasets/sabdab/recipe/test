@@ -56,11 +56,6 @@ def verify(directory, config=None):
                     expected.update((row["antigen_chain"] or "").split("|") if row["antigen_chain"] else [])
                     if not expected <= chains:
                         raise ValueError(f"missing coordinate chains in {key}: {expected - chains}")
-                    if "_atom_site.label_seq_id" in content:
-                        polymer = {chain for chain, seq in zip(content["_atom_site.auth_asym_id"],
-                                   content["_atom_site.label_seq_id"], strict=True) if seq not in (".", "?")}
-                        if polymer - expected:
-                            raise ValueError(f"unexpected polymer chains in {key}: {polymer - expected}")
                     for entry in content.get("_entry.id", []):
                         pdb = entry.lower()
                         if len(pdb) == 4:
