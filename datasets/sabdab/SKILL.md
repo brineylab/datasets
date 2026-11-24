@@ -19,7 +19,7 @@ Hub: `brineylab/sabdab`, tag `v1.0.0`.
 Every column of the upstream all-instance summary CSV is kept under its source name, with `PDB_ID` alongside the source's `PDB`. Empty source fields are null. A column uses an integer, float or date type only when every nonmissing value in that column converts; otherwise it is UTF-8 text. Two derived columns are appended:
 
 - `cdrh3_length_aa`: length of the reported IMGT `CDR-H3` sequence, null when that sequence is missing;
-- `cif`: the decompressed UTF-8 text of SAbDab2's IMGT-numbered instance crop (`instance_structures/*_abag.cif.gz` when it has bound antigens, otherwise `*_ab.cif.gz`).
+- `cif`: the decompressed UTF-8 text of SAbDab2's IMGT-numbered instance crop (`instance_structures/*_abag*.cif.gz` when it has bound antigens, otherwise `*_ab*.cif.gz`; case-colliding crops have numeric suffixes).
 
 `data/_snapshot.json` records the source URL, capture time, SAbDab2 `last_update` marker, instance count, summary and archive SHA-256 checksums, the summary column order, and sample CIF checksums.
 
@@ -43,7 +43,7 @@ if hits.height:
 
 ## Recipe
 
-`recipe/build <out>` runs in `datascience@1.2.0`: it downloads `/api/download/all-summary`, creates one `/api/download/search-structures/jobs` job with `full_structure=false`, `antibody_instance_crops=true`, `include_antigen=true`, and downloads that job's single tar archive. It never requests a detail record or a structure per entry. Both the archive's own summary and the live summary must agree on all 22,866 rows, `/api/stats/summary` must report a stable `last_update` before and after collection, and every summary `INSTANCE` must match exactly one crop. Source inputs are cached under `<out>/cache/.work/`, and completed Parquet shards and `_snapshot.json` are moved into `<out>/data/` only after reconciliation. `params.toml` sets `api = "https://sabdab.opig.stats.ox.ac.uk/api"`; `last_update` and `summary_sha256` pin this capture. A source revision or checksum mismatch stops the build.
+`recipe/build <out>` runs in `datascience@1.2.0`: it downloads `/api/download/all-summary`, creates one `/api/download/search-structures/jobs` job with `full_structure=false`, `antibody_instance_crops=true`, `include_antigen=true`, and downloads that job's single tar archive. It never requests a detail record or a structure per entry. Both the archive's own summary and the live summary must agree on all 22,866 rows, `/api/stats/summary` must report a stable `last_update` before and after collection, and every summary `INSTANCE` must match exactly one crop. Source inputs are cached under `<out>/.work/`, and completed Parquet shards and `_snapshot.json` are moved into `<out>/data/` only after reconciliation. `params.toml` sets `api = "https://sabdab.opig.stats.ox.ac.uk/api"`; `last_update` and `summary_sha256` pin this capture. A source revision or checksum mismatch stops the build.
 
 Source data by the Oxford Protein Informatics Group, used under [CC BY 4.0](https://sabdab.opig.stats.ox.ac.uk/about). [Capel et al., *SAbDab2: the structural antibody database in the age of machine learning*](https://doi.org/10.1093/nar/gkag1091).
 

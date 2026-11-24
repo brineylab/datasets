@@ -109,7 +109,12 @@ def assemble(source, config, work, dest):
     schema = pa.schema([*table.schema, *(pa.field(k, v) for k, v in extras.items())])
     indexes = {key: idx for idx, key in enumerate(rows)}
     pending = set(rows)
-    crop_instances = None
+    crop_instances = {}
+    for key, row in rows.items():
+        stem = "_".join([row["PDB_ID"], row["Hchain"] or "+", row["Lchain"] or "+"])
+        if stem in crop_instances:
+            raise ValueError(f"Two instances map to the same crop: {stem}")
+        crop_instances[stem] = key
     counts = Counter(r["PDB_ID"] for r in rows.values())
     samples, categories, shards = {}, set(), []
     repeated = next((pdb for pdb, n in counts.items() if n > 1), None)
@@ -125,14 +130,10 @@ def assemble(source, config, work, dest):
                     continue
                 if path.name.lower() == "sabdab_summary.csv":
                     archive_rows = inventory(tar.extractfile(member).read())
-                    # Case-colliding filenames get numeric suffixes; this is the source's authoritative join.
-                    crop_instances = {}
-                    for key, row in archive_rows.items():
-                        name = PurePosixPath(row.pop("filename_in_archive") or "")
-                        if (str(name) != "instance_structures/" + name.name or
-                                not name.name.endswith(".cif.gz") or str(name) in crop_instances):
-                            raise CropArchiveError(f"Missing, invalid or duplicate crop mapping for {key}: {name}")
-                        crop_instances[str(name)] = key
+                    # This path is export bookkeeping, not a SAbDab2 summary annotation.
+                    archive_rows = {key: {name: value for name, value in row.items()
+                                          if name != "filename_in_archive"}
+                                    for key, row in archive_rows.items()}
                     if have_summary or archive_rows != rows:
                         only_archive = sorted(set(archive_rows) - set(rows))
                         only_summary = sorted(set(rows) - set(archive_rows))
@@ -153,16 +154,15 @@ def assemble(source, config, work, dest):
                     continue
                 if path.parent.name != "instance_structures" or not path.name.endswith(".cif.gz"):
                     continue
-                if crop_instances is None or str(path) not in crop_instances:
+                stem, kind = path.name.removesuffix(".cif.gz").rsplit("_", 1)
+                if stem not in crop_instances or not have_summary:
                     raise CropArchiveError(f"Duplicate, unexpected or prematurely ordered instance crop: {path}")
-                key = crop_instances[str(path)]
+                key = crop_instances[stem]
                 if key not in pending:
                     raise CropArchiveError(f"Duplicate instance crop: {path}")
                 pending.remove(key)
-                idx = indexes[key]
-                row = rows[key]
+                idx, row = indexes[key], rows[key]
                 has_antigen = bool(row["antigen_chain"])
-                kind = path.name.removesuffix(".cif.gz").rsplit("_", 1)[-1]
                 if kind.rstrip("0123456789") != ("abag" if has_antigen else "ab"):
                     raise CropArchiveError(f"Incorrect antigen download option for {key}: {path}")
                 data = gzip.decompress(tar.extractfile(member).read())
