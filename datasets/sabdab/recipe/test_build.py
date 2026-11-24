@@ -67,23 +67,23 @@ class Export:
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
                 tar.addfile(info, io.BytesIO(data))
+            names = ["instance_structures/" + name for name in self.files]
+            if self.case == "unbound_ab":
+                # Rename both the archive files and their source mapping, as the export does.
+                names = [name.replace("_abag", "_ab") for name in names]
             buf = io.StringIO()
-            fields = [*self.rows[0], "filename_in_archive"]
-            csvfile = csv.DictWriter(buf, fields)
+            csvfile = csv.DictWriter(buf, [*self.rows[0], "filename_in_archive"])
             csvfile.writeheader()
-            csvfile.writerows([{**row, "filename_in_archive": "instance_structures/" + self.archive_names[row["INSTANCE"]]}
-                               for row in self.rows])
+            csvfile.writerows([{**row, "filename_in_archive": name}
+                               for row, name in zip(self.rows, names, strict=True)])
             add("SAbDab_summary.csv", buf.getvalue().encode())
             for i, (name, data) in enumerate(self.files.items()):
                 if self.case == "missing" and i == 0:
                     continue
                 if self.case == "ambiguous" and i == 2:
-                    # A superset alone would match both H/L and h/l; exact chain equality must not decide it.
-                    name = "instance_structures/ambiguous.cif.gz"
-                if self.case == "unbound_ab":
-                    # Source examples use _ab even where the summary names antigen chains.
-                    name = name.replace("_abag", "_ab")
-                add("instance_structures/" + name, gzip.compress(data))
+                    # File-name edits cannot spoof the source's explicit instance mapping.
+                    names[i] = "instance_structures/ambiguous.cif.gz"
+                add(names[i], gzip.compress(data))
 
 
 class SnapshotTest(unittest.TestCase):
@@ -108,6 +108,24 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual([r["cif"].encode() for r in rows], list(source.files.values()))
             with self.assertRaisesRegex(ValueError, "pinned last_update"):
                 verify(root, {"last_update": "another release", "summary_sha256": ""})
+
+    def test_identical_crops_use_source_instance_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = Export()
+            source.rows[0]["antigen_chain"] = "h|l"
+            source.rows[1]["antigen_chain"] = "H|L"
+            first = source.archive_names[source.rows[0]["INSTANCE"]]
+            second = source.archive_names[source.rows[1]["INSTANCE"]]
+            # Reciprocal antigen assignments make the two exact-case chain sets identical,
+            # so only the source's explicit INSTANCE-to-path mapping distinguishes them.
+            shared = ("data_test\r\n_entry.id TEST\r\nloop_\r\n_atom_site.auth_asym_id\r\n"
+                      "_atom_site.label_seq_id\r\n" + "\r\n".join(
+                          f"{chain} 1" for chain in ("H", "L", "h", "l")) + "\r\n").encode()
+            source.files[first] = shared
+            source.files[second] = shared
+            self.capture(root, source)
+            verify(root)
 
     def test_unbound_export_filename_does_not_identify_instance(self):
         with tempfile.TemporaryDirectory() as tmp:
