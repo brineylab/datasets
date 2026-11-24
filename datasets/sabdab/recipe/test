@@ -25,7 +25,7 @@ def verify(directory, config=None):
         raise ValueError("missing or unexpected Parquet shards")
     samples = manifest["samples"].copy()
     schema = pq.read_schema(paths[0])
-    for name in [*manifest["summary_columns"], "cdrh3_length_aa", "cif"]:
+    for name in [*manifest["summary_columns"], "archive_filename", "cdrh3_length_aa", "cif"]:
         schema.field(name)
     if schema.field("cif").type != pa.large_string() or schema.field("cdrh3_length_aa").type != pa.int32():
         raise ValueError("unexpected CIF or CDR length type")

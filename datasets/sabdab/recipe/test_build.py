@@ -33,12 +33,14 @@ class Export:
             ab = f"pair{i}"
             self.rows.append({"INSTANCE": key, "PDB": pdb, "SABDAB_ID": ab, "HEAVY_ID": h,
                               "LIGHT_ID": l, "Hchain": h, "Lchain": l, "CDR-H3": "A"*16 if h else None,
-                              "antigen_chain": "|".join(antigens),
+                              "antigen_chain": "|".join(antigens), "date": "2026/11/24",
                               "heavy_taxid": 9606 if h else None, "extra_summary_column": "kept"})
             name = f"{pdb}_{h or '+'}_{l}_{'abag' if antigens else 'ab'}{i + 1 if i < 2 else ''}.cif.gz"
             self.archive_names[key] = name
             chains = " ".join(c for c in (h, l, *antigens) if c)
-            self.files[name] = ("data_test\r\n_entry.id TEST\r\nloop_\r\n_atom_site.auth_asym_id\r\n" + chains + "\r\n").encode()
+            self.files[name] = ("data_test\r\n_entry.id TEST\r\nloop_\r\n_atom_site.auth_asym_id\r\n"
+                                "_atom_site.label_seq_id\r\n" + "\r\n".join(
+                                    f"{chain} 1" for chain in (h, l, *antigens) if chain) + "\r\n").encode()
 
     def get(self, path):
         if path == "/stats/summary":
@@ -52,7 +54,7 @@ class Export:
             csvfile.writerows(self.rows)
             if self.case == "duplicate":
                 csvfile.writerow(self.rows[0])
-            return buf.getvalue().encode()
+            return buf.getvalue().encode("utf-8-sig")
         if path.startswith("/pdb?"):
             return json.dumps({"total": 1, "results": [self.objects["/pdb/pdb_0000test"]]}).encode()
         if path.startswith("/pdb/"):
@@ -75,10 +77,18 @@ class Export:
             for i, (name, data) in enumerate(self.files.items()):
                 if self.case == "missing" and i == 0:
                     continue
+                if self.case == "ambiguous" and i == 2:
+                    # A superset alone would match both H/L and h/l; exact chain equality must not decide it.
+                    name = "instance_structures/ambiguous.cif.gz"
+                if self.case == "unbound_ab":
+                    # Source examples use _ab even where the summary names antigen chains.
+                    name = name.replace("_abag", "_ab")
                 add("instance_structures/" + name, gzip.compress(data))
 
 
 class SnapshotTest(unittest.TestCase):
+    maxDiff = None
+
     def capture(self, root, source):
         data = root / "data"
         data.mkdir()
@@ -94,13 +104,24 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual([r["PDB_ID"] for r in rows], [rows[0]["PDB"]]*3)
             self.assertEqual([r["cdrh3_length_aa"] for r in rows], [16, 16, None])
             self.assertEqual([r["extra_summary_column"] for r in rows], ["kept"]*3)
+            self.assertEqual([r["archive_filename"] for r in rows], ["instance_structures/" + name for name in source.files])
             self.assertEqual([r["cif"].encode() for r in rows], list(source.files.values()))
             with self.assertRaisesRegex(ValueError, "pinned last_update"):
                 verify(root, {"last_update": "another release", "summary_sha256": ""})
 
+    def test_unbound_export_filename_does_not_identify_instance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = Export()
+            source.case = "unbound_ab"
+            self.capture(root, source)
+            rows = pq.read_table(root / "data").to_pylist()
+            self.assertTrue(all("_ab" in row["archive_filename"] and "_abag" not in row["archive_filename"] for row in rows))
+
     def test_inconsistent_exports(self):
         for case, message in [("duplicate", "duplicate source identifier"),
-                              ("missing", "Missing archive"), ("refresh", "Source changed")]:
+                              ("missing", "Missing archive"), ("ambiguous", "exactly one instance"),
+                              ("refresh", "Source changed")]:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
                 source = Export()
                 source.case = case

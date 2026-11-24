@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -33,6 +34,28 @@ REQUIRED = {"INSTANCE", "SABDAB_ID", "HEAVY_ID", "LIGHT_ID", "Hchain", "Lchain",
 
 class CropArchiveError(ValueError):
     """The downloaded archive must be acquired again."""
+
+
+def deposition(cif):
+    """Read the deposition identifier without changing any chain identifier."""
+    entry = cif.get("_entry.id", [])
+    if isinstance(entry, str):
+        entry = [entry]
+    if len(entry) != 1:
+        raise CropArchiveError(f"Invalid or missing mmCIF entry ID: {entry}")
+    pdb = entry[0].lower()
+    if len(pdb) == 4:
+        pdb = "pdb_0000" + pdb
+    return pdb
+
+
+def antibody_chains(cif):
+    """Observed polymer chains, preserving the mmCIF's author chain-ID case."""
+    chains = set(cif["_atom_site.auth_asym_id"])
+    if "_atom_site.label_seq_id" not in cif:
+        return chains
+    return {chain for chain, seq in zip(cif["_atom_site.auth_asym_id"],
+            cif["_atom_site.label_seq_id"], strict=True) if seq not in (".", "?")}
 
 
 def inventory(raw):
@@ -103,7 +126,7 @@ def assemble(source, config, work, dest):
     if not archive.exists():
         source.archive(archive)
     table = summary_table(rows)
-    extras = {"cdrh3_length_aa": pa.int32(), "cif": pa.large_string()}
+    extras = {"archive_filename": pa.string(), "cdrh3_length_aa": pa.int32(), "cif": pa.large_string()}
     if set(extras).intersection(table.column_names):
         raise ValueError("Upstream column collides with a derived field")
     schema = pa.schema([*table.schema, *(pa.field(k, v) for k, v in extras.items())])
@@ -111,10 +134,9 @@ def assemble(source, config, work, dest):
     pending = set(rows)
     crop_instances = {}
     for key, row in rows.items():
-        stem = "_".join([row["PDB_ID"], row["Hchain"] or "+", row["Lchain"] or "+"])
-        if stem in crop_instances:
-            raise ValueError(f"Two instances map to the same crop: {stem}")
-        crop_instances[stem] = key
+        antibody = {chain for chain in (row["Hchain"], row["Lchain"]) if chain}
+        antigens = set((row["antigen_chain"] or "").split("|")) - {""}
+        crop_instances.setdefault(row["PDB_ID"].lower(), []).append((key, antibody, antibody | antigens))
     counts = Counter(r["PDB_ID"] for r in rows.values())
     samples, categories, shards = {}, set(), []
     repeated = next((pdb for pdb, n in counts.items() if n > 1), None)
@@ -154,20 +176,40 @@ def assemble(source, config, work, dest):
                     continue
                 if path.parent.name != "instance_structures" or not path.name.endswith(".cif.gz"):
                     continue
-                stem, kind = path.name.removesuffix(".cif.gz").rsplit("_", 1)
-                if stem not in crop_instances or not have_summary:
-                    raise CropArchiveError(f"Duplicate, unexpected or prematurely ordered instance crop: {path}")
-                key = crop_instances[stem]
+                if not have_summary:
+                    raise CropArchiveError(f"The archive summary does not precede its crops: {path}")
+                data = gzip.decompress(tar.extractfile(member).read())
+                try:
+                    cif = MMCIF2Dict(io.StringIO(data.decode()))
+                    polymer = antibody_chains(cif)
+                    pdb = deposition(cif)
+                    kind = path.name.removesuffix(".cif.gz").rsplit("_", 1)[1]
+                except (UnicodeError, KeyError, IndexError, AttributeError, TypeError) as error:
+                    raise CropArchiveError(f"Cannot parse instance crop {path}: {error}") from error
+                candidates = [key for key, antibody, chains in crop_instances.get(pdb, [])
+                              if antibody <= polymer and polymer <= chains]
+                if len(candidates) > 1:
+                    candidates = [key for key, antibody, chains in crop_instances.get(pdb, [])
+                                  if polymer == chains and key in candidates]
+                if len(candidates) != 1:
+                    raise CropArchiveError(json.dumps({
+                        "error": "A crop does not match exactly one instance by its mmCIF chain IDs",
+                        "path": str(path), "entry": pdb, "polymer_chains": sorted(polymer),
+                        "candidates": candidates}))
+                key = candidates[0]
                 if key not in pending:
                     raise CropArchiveError(f"Duplicate instance crop: {path}")
                 pending.remove(key)
                 idx, row = indexes[key], rows[key]
                 has_antigen = bool(row["antigen_chain"])
-                if kind.rstrip("0123456789") != ("abag" if has_antigen else "ab"):
+                antigens = set((row["antigen_chain"] or "").split("|")) - {""}
+                antibody = {row["Hchain"], row["Lchain"]} - {None}
+                if not antigens <= set(cif["_atom_site.auth_asym_id"]):
+                    raise CropArchiveError(f"Missing annotated antigen chains in {key}: {path}")
+                if not has_antigen and not antibody <= polymer:
+                    raise CropArchiveError(f"Missing antibody chains in {key}: {path}")
+                if kind.rstrip("0123456789") not in ({"ab", "abag"} if not has_antigen else {"abag"}):
                     raise CropArchiveError(f"Incorrect antigen download option for {key}: {path}")
-                data = gzip.decompress(tar.extractfile(member).read())
-                if not data.lstrip().startswith(b"data_"):
-                    raise CropArchiveError(f"Invalid CIF: {path}")
                 flags = {"any"}
                 if row["PDB_ID"] == repeated and repeated_samples < 2:
                     repeated_samples += 1
@@ -186,6 +228,7 @@ def assemble(source, config, work, dest):
                     categories.update(flags)
                 cdr = row["CDR-H3"]
                 item = {**table.slice(idx, 1).to_pylist()[0], "cif": data.decode(),
+                        "archive_filename": str(path),
                         "cdrh3_length_aa": len(cdr) if cdr else None}
                 if writer is None:
                     shards.append(f"{len(shards):05d}.parquet")
