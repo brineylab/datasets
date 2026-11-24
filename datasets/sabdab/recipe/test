@@ -1,0 +1,75 @@
+#!/usr/bin/env -S python3 -I
+"""Check a SAbDab snapshot using only the files a reader downloads."""
+import hashlib
+import io
+import json
+import sys
+import tomllib
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+
+
+def verify(directory, config=None):
+    data = directory / "data"
+    snapshot = pq.read_table(directory / "_snapshot.parquet")
+    if snapshot.num_rows != 1 or snapshot.column_names != ["manifest"]:
+        raise ValueError("snapshot manifest must be one row with a manifest column")
+    manifest = json.loads(snapshot["manifest"][0].as_py())
+    if config:
+        for key in ("last_update", "summary_sha256"):
+            if config[key] and config[key] != manifest[key]:
+                raise ValueError(f"snapshot does not match the pinned {key}")
+    ids = set()
+    paths = sorted(data.glob("*.parquet"))
+    if not paths or [p.name for p in paths] != manifest["shards"]:
+        raise ValueError("missing or unexpected Parquet shards")
+    samples = manifest["samples"].copy()
+    schema = pq.read_schema(paths[0])
+    for name in [*manifest["summary_columns"], "archive_filename", "cdrh3_length_aa", "cif"]:
+        schema.field(name)
+    if schema.field("cif").type != pa.large_string() or schema.field("cdrh3_length_aa").type != pa.int32():
+        raise ValueError("unexpected CIF or CDR length type")
+    for path in paths:
+        pf = pq.ParquetFile(path)
+        if pf.schema_arrow != schema:
+            raise ValueError(f"schema mismatch in {path}")
+        for group in range(pf.num_row_groups):
+            cols = ["INSTANCE", "PDB_ID", "CDR-H3", "cdrh3_length_aa", "Hchain", "Lchain", "antigen_chain"]
+            rows = pf.read_row_group(group, columns=cols).to_pylist()
+            wanted = [(n, r) for n, r in enumerate(rows) if r["INSTANCE"] in samples]
+            for row in rows:
+                key = row["INSTANCE"]
+                seq = row["CDR-H3"]
+                if not key or key in ids or row["cdrh3_length_aa"] != (len(seq) if seq else None):
+                    raise ValueError(f"invalid instance or length: {key}")
+                ids.add(key)
+            if wanted:
+                cifs = pf.read_row_group(group, columns=["cif"]).column(0)
+                for index, row in wanted:
+                    key = row["INSTANCE"]
+                    cif = cifs[index].as_py()
+                    if hashlib.sha256(cif.encode()).hexdigest() != samples.pop(key):
+                        raise ValueError(f"CIF differs from source: {key}")
+                    content = MMCIF2Dict(io.StringIO(cif))
+                    chains = set(content["_atom_site.auth_asym_id"])
+                    expected = {row["Hchain"], row["Lchain"]} - {None}
+                    expected.update((row["antigen_chain"] or "").split("|") if row["antigen_chain"] else [])
+                    if not expected <= chains:
+                        raise ValueError(f"missing coordinate chains in {key}: {expected - chains}")
+                    for entry in content.get("_entry.id", []):
+                        pdb = entry.lower()
+                        if len(pdb) == 4:
+                            pdb = "pdb_0000" + pdb
+                        if pdb.startswith("pdb_") and pdb != row["PDB_ID"].lower():
+                            raise ValueError(f"wrong coordinate deposition in {key}: {entry}")
+    digest = hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest()
+    if samples or not manifest["samples"] or len(ids) != manifest["instances"] or digest != manifest["inventory_sha256"]:
+        raise ValueError("source inventory or sample mismatch")
+    print(f"{len(ids)} unique instances, {len(paths)} shards, {len(manifest['samples'])} CIF samples verified")
+
+
+if __name__ == "__main__":
+    verify(Path(sys.argv[1]), tomllib.loads(Path(__file__).with_name("params.toml").read_text()))

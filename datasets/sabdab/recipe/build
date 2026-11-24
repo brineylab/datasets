@@ -1,0 +1,292 @@
+#!/usr/bin/env -S python3 -I
+"""Build a complete SAbDab2 instance snapshot in <out>/data.
+
+The all-instance summary supplies every source column. One background download job supplies all
+IMGT-numbered instance crops, with antigens. No per-instance API records or requests are used.
+"""
+import csv
+import datetime as dt
+import fcntl
+import gzip
+import hashlib
+import io
+import json
+import os
+import sys
+import tarfile
+import tempfile
+import tomllib
+from collections import Counter
+from pathlib import Path, PurePosixPath
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source import Source, digest
+
+MIB = 1024**2
+REQUIRED = {"INSTANCE", "SABDAB_ID", "HEAVY_ID", "LIGHT_ID", "Hchain", "Lchain",
+            "CDR-H3", "antigen_chain", "heavy_taxid"}
+
+
+class CropArchiveError(ValueError):
+    """The downloaded archive must be acquired again."""
+
+
+def deposition(cif):
+    """Read the deposition identifier without changing any chain identifier."""
+    entry = cif.get("_entry.id", [])
+    if isinstance(entry, str):
+        entry = [entry]
+    if len(entry) != 1:
+        raise CropArchiveError(f"Invalid or missing mmCIF entry ID: {entry}")
+    pdb = entry[0].lower()
+    if len(pdb) == 4:
+        pdb = "pdb_0000" + pdb
+    return pdb
+
+
+def antibody_chains(cif):
+    """Observed polymer chains, preserving the mmCIF's author chain-ID case."""
+    chains = set(cif["_atom_site.auth_asym_id"])
+    if "_atom_site.label_seq_id" not in cif:
+        return chains
+    return {chain for chain, seq in zip(cif["_atom_site.auth_asym_id"],
+            cif["_atom_site.label_seq_id"], strict=True) if seq not in (".", "?")}
+
+
+def inventory(raw):
+    """The source CSV by INSTANCE, retaining its order and all headers; empty fields are null."""
+    csvfile = csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""))
+    names = csvfile.fieldnames or []
+    if len(set(names)) != len(names) or not REQUIRED <= set(names) or not {"PDB", "PDB_ID"}.intersection(names):
+        raise ValueError(f"Invalid summary header: {names}")
+    rows = {}
+    for item in csvfile:
+        if None in item or None in item.values():
+            raise ValueError("Malformed summary row")
+        row = {k: v or None for k, v in item.items()}
+        if "PDB_ID" not in row:
+            row["PDB_ID"] = row["PDB"]
+        key = row["INSTANCE"]
+        if not key or not row["PDB_ID"] or not row["SABDAB_ID"] or key in rows:
+            raise ValueError(f"Missing or duplicate source identifier: {key}")
+        rows[key] = row
+    if not rows:
+        raise ValueError("Empty source inventory")
+    return rows
+
+
+def summary_table(rows):
+    """Use a scalar or date type only if every nonmissing source value converts."""
+    columns = {name: [r[name] for r in rows.values()] for name in next(iter(rows.values()))}
+    for name, values in columns.items():
+        if name in {"date", "SABDABdepo_date", "SABDABupdate_date"}:
+            def convert(value):
+                value = value.replace("/", "-")
+                return dt.datetime.strptime(value, "%Y%m%d").date() if len(value) == 8 and value.isdigit() else dt.date.fromisoformat(value)
+            dtype = pa.date32()
+        else:
+            try:
+                pa.array(values, type=pa.int64(), from_pandas=False)
+                convert, dtype = int, pa.int64()
+            except (ValueError, OverflowError):
+                try:
+                    pa.array(values, type=pa.float64(), from_pandas=False)
+                    convert, dtype = float, pa.float64()
+                except (ValueError, OverflowError):
+                    columns[name] = pa.array(values, type=pa.string())
+                    continue
+        try:
+            columns[name] = pa.array([convert(v) if v is not None else None for v in values], type=dtype)
+        except (ValueError, OverflowError):
+            columns[name] = pa.array(values, type=pa.string())
+    return pa.table(columns)
+
+
+def assemble(source, config, work, dest):
+    start = dt.datetime.now(dt.timezone.utc).isoformat()
+    stats = json.loads(source.get("/stats/summary"))
+    marker = stats["last_update"]
+    if not marker or (config["last_update"] and config["last_update"] != marker):
+        raise ValueError(f"Source revision differs from recipe: {marker}")
+    raw = source.get("/download/all-summary")
+    if config.get("summary_sha256") and config["summary_sha256"] != digest(raw):
+        raise ValueError("Source summary checksum differs from recipe")
+    rows = inventory(raw)
+    if len(rows) != stats["antibody_instances"]:
+        raise ValueError("Source statistics and instance inventory disagree")
+    cache = work / digest(json.dumps([source.base, marker, digest(raw)]).encode())
+    cache.mkdir(exist_ok=True)
+    (cache / "summary.csv").write_bytes(raw)
+    archive = cache / "instances.tar"
+    if not archive.exists():
+        source.archive(archive)
+    table = summary_table(rows)
+    extras = {"archive_filename": pa.string(), "cdrh3_length_aa": pa.int32(), "cif": pa.large_string()}
+    if set(extras).intersection(table.column_names):
+        raise ValueError("Upstream column collides with a derived field")
+    schema = pa.schema([*table.schema, *(pa.field(k, v) for k, v in extras.items())])
+    indexes = {key: idx for idx, key in enumerate(rows)}
+    pending = set(rows)
+    crop_instances = {}
+    for key, row in rows.items():
+        antibody = {chain for chain in (row["Hchain"], row["Lchain"]) if chain}
+        crop_instances.setdefault(row["PDB_ID"].lower(), []).append((key, antibody))
+    counts = Counter(r["PDB_ID"] for r in rows.values())
+    samples, categories, shards = {}, set(), []
+    repeated = next((pdb for pdb, n in counts.items() if n > 1), None)
+    repeated_samples = 0
+    have_summary = False
+    writer = None
+    batch, batch_bytes, shard_bytes = [], 0, 0
+    try:
+        with tarfile.open(archive, "r|*") as tar:
+            for member in tar:
+                path = PurePosixPath(member.name)
+                if not member.isfile():
+                    continue
+                if path.name.lower() == "sabdab_summary.csv":
+                    archive_rows = inventory(tar.extractfile(member).read())
+                    # This path is export bookkeeping, not a SAbDab2 summary annotation.
+                    archive_files = {key: row.pop("filename_in_archive", None)
+                                     for key, row in archive_rows.items()}
+                    if (set(archive_files) != set(rows)
+                            or any(not name or not name.startswith("instance_structures/")
+                                   or name.count("/") != 1 or not name.endswith(".cif.gz")
+                                   for name in archive_files.values())
+                            or len(set(archive_files.values())) != len(archive_files)):
+                        raise CropArchiveError("The archive must map every instance to exactly one crop path")
+                    if have_summary or archive_rows != rows:
+                        only_archive = sorted(set(archive_rows) - set(rows))
+                        only_summary = sorted(set(rows) - set(archive_rows))
+                        differing = {}
+                        for key in sorted(set(archive_rows) & set(rows)):
+                            fields = {name: [rows[key].get(name), archive_rows[key].get(name)]
+                                      for name in set(rows[key]) | set(archive_rows[key])
+                                      if rows[key].get(name) != archive_rows[key].get(name)}
+                            if fields:
+                                differing[key] = fields
+                                if len(differing) == 3:
+                                    break
+                        raise CropArchiveError(json.dumps(
+                            {"error": "Archive and source inventories differ",
+                             "only_archive": only_archive[:20], "only_summary": only_summary[:20],
+                             "differing_examples": differing}, default=str))
+                    have_summary = True
+                    continue
+                if path.parent.name != "instance_structures" or not path.name.endswith(".cif.gz"):
+                    continue
+                if not have_summary:
+                    raise CropArchiveError(f"The archive summary does not precede its crops: {path}")
+                data = gzip.decompress(tar.extractfile(member).read())
+                try:
+                    cif = MMCIF2Dict(io.StringIO(data.decode()))
+                    polymer = antibody_chains(cif)
+                    pdb = deposition(cif)
+                except (UnicodeError, KeyError, IndexError, AttributeError, TypeError) as error:
+                    raise CropArchiveError(f"Cannot parse instance crop {path}: {error}") from error
+                # Identical crops can carry different instance identities (e.g. reciprocal
+                # antibody/antigen pairings), so chain sets alone are not always sufficient.
+                # The archive summary's explicit mapping disambiguates them; mmCIF content
+                # still validates the required exact-case antibody assignment. A source crop
+                # can contain additional polymer chains beyond its summary's annotations.
+                candidates = [key for key, antibody in crop_instances.get(pdb, [])
+                              if antibody <= polymer and archive_files[key] == str(path)]
+                if len(candidates) != 1:
+                    raise CropArchiveError(json.dumps({
+                        "error": "A crop does not match exactly one instance by its source archive mapping and mmCIF chain IDs",
+                        "path": str(path), "entry": pdb, "polymer_chains": sorted(polymer),
+                        "candidates": candidates}))
+                key = candidates[0]
+                if key not in pending:
+                    raise CropArchiveError(f"Duplicate instance crop: {path}")
+                pending.remove(key)
+                idx, row = indexes[key], rows[key]
+                has_antigen = bool(row["antigen_chain"])
+                antigens = set((row["antigen_chain"] or "").split("|")) - {""}
+                antibody = {row["Hchain"], row["Lchain"]} - {None}
+                if not antigens <= set(cif["_atom_site.auth_asym_id"]):
+                    raise CropArchiveError(f"Missing annotated antigen chains in {key}: {path}")
+                if not has_antigen and not antibody <= polymer:
+                    raise CropArchiveError(f"Missing antibody chains in {key}: {path}")
+                flags = {"any"}
+                if row["PDB_ID"] == repeated and repeated_samples < 2:
+                    repeated_samples += 1
+                    flags.add(f"repeated PDB, copy {repeated_samples}")
+                if row["Hchain"] is None:
+                    flags.add("light only")
+                if row["Lchain"] is None:
+                    flags.add("heavy only")
+                if row.get("chainsharing_construct") == "SCFV":
+                    flags.add("scFv")
+                if row["Hchain"] and row["Lchain"] and has_antigen:
+                    flags.add("paired complex")
+                flags.add("bound antigen" if has_antigen else "no antigen")
+                if flags - categories:
+                    samples[key] = digest(data)
+                    categories.update(flags)
+                cdr = row["CDR-H3"]
+                item = {**table.slice(idx, 1).to_pylist()[0], "cif": data.decode(),
+                        "archive_filename": str(path),
+                        "cdrh3_length_aa": len(cdr) if cdr else None}
+                if writer is None:
+                    shards.append(f"{len(shards):05d}.parquet")
+                    writer = pq.ParquetWriter(dest / shards[-1], schema, compression="zstd",
+                                              use_dictionary=False, write_statistics=table.column_names + ["cdrh3_length_aa"])
+                    shard_bytes = 0
+                batch.append(item)
+                batch_bytes += len(data)
+                if batch_bytes >= 16 * MIB or len(batch) >= 128:
+                    writer.write_table(pa.Table.from_pylist(batch, schema=schema))
+                    shard_bytes += batch_bytes
+                    batch, batch_bytes = [], 0
+                    if shard_bytes >= 2048 * MIB:
+                        writer.close()
+                        writer = None
+            if batch:
+                writer.write_table(pa.Table.from_pylist(batch, schema=schema))
+        if pending or not have_summary:
+            raise CropArchiveError(f"Missing archive summary or instance crops: {sorted(pending)[:4]}")
+    except (CropArchiveError, tarfile.TarError, EOFError, gzip.BadGzipFile):
+        archive.unlink(missing_ok=True)
+        raise
+    finally:
+        if writer is not None:
+            writer.close()
+    if (inventory(source.get("/download/all-summary")) != rows or
+            json.loads(source.get("/stats/summary"))["last_update"] != marker):
+        raise ValueError("Source changed during capture")
+    with archive.open("rb") as f:
+        archive_sha = hashlib.file_digest(f, "sha256").hexdigest()
+    manifest = dict(source=source.base, captured_at=start, last_update=marker, instances=len(rows),
+                    summary_sha256=digest(raw), archive_sha256=archive_sha,
+                    inventory_sha256=digest("\n".join(sorted(rows)).encode()),
+                    summary_columns=table.column_names,
+                    samples=samples, shards=shards)
+    snapshot = pa.table({"manifest": [json.dumps(manifest, indent=2, sort_keys=True)]})
+    pq.write_table(snapshot, dest.parent / "_snapshot.parquet", compression="zstd")
+    print(f"Built {len(rows)} instances in {len(shards)} shards; {len(samples)} CIF samples catalogued")
+
+
+def main(out):
+    config = tomllib.loads(Path(__file__).with_name("params.toml").read_text())
+    work = out / ".work"
+    work.mkdir(parents=True, exist_ok=True)
+    with (work / "build.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if (out / "data").exists():
+            raise FileExistsError(f"Snapshot exists at {out / 'data'}; use a new output directory")
+        with tempfile.TemporaryDirectory(dir=work) as tmp:
+            dest = Path(tmp) / "data"
+            dest.mkdir()
+            assemble(Source(config["api"]), config, work, dest)
+            os.rename(dest, out / "data")
+            os.rename(dest.parent / "_snapshot.parquet", out / "_snapshot.parquet")
+
+
+if __name__ == "__main__":
+    main(Path(sys.argv[1]))

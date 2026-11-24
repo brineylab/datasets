@@ -1,0 +1,4 @@
+api = "https://sabdab.opig.stats.ox.ac.uk/api"
+# Filled from the first full capture before release.
+last_update = ""
+summary_sha256 = ""
