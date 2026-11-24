@@ -2,7 +2,7 @@
 name: epam-pcps
 description: "The six EPAM parent-child-pair corpora (FlAIRR, RACE, Tang, Wyatt/Jaffe, and Replay IGH/IGK) as ordered parquet, with one canonical whole-clonal-family 20,000-pair-target subsample each of Tang and Wyatt. Reach for it to evaluate antibody-evolution models on identical EPAM inputs without fetching and resampling the deposit independently."
 metadata:
-  version: 1.0.1
+  version: 1.0.2
   tools: datascience@1.2.0
   license: cc-by-4.0
   count: 743080
@@ -10,9 +10,9 @@ metadata:
 ---
 # epam-pcps
 
-Hub: `brineylab/epam-pcps`, tag `v1.0.1`
+Hub: `brineylab/epam-pcps`, tag `v1.0.2`
 
-EPAM (Sung et al., *PLOS Computational Biology* 2025; the deposit credits Johnson et al.) evaluates the real parent-to-child step of antibody somatic hypermutation. One row here is one parent-child pair (PCP), carrying the parent and observed-child BCR nucleotide sequences and their clonal-family annotations. The six-corpora total is 743,080 PCPs; the subsamples are views of already-counted rows.
+EPAM (Johnson et al., "Nucleotide context models outperform protein language models for predicting antibody affinity maturation," *PLOS Computational Biology* 2025, DOI `10.1371/journal.pcbi.1013758`) evaluates the real parent-to-child step of antibody somatic hypermutation. One row here is one parent-child pair (PCP), carrying the parent and observed-child BCR nucleotide sequences and their clonal-family annotations. The six-corpora total is 743,080 PCPs; the subsamples are views of already-counted rows.
 
 ## Files
 
@@ -58,7 +58,7 @@ This draw is new: it does not reproduce campaign `aa191851` (seed 0) or `c8eae86
 from huggingface_hub import snapshot_download
 import polars as pl
 
-path = snapshot_download("brineylab/epam-pcps", repo_type="dataset", revision="v1.0.1")
+path = snapshot_download("brineylab/epam-pcps", repo_type="dataset", revision="v1.0.2")
 tang = pl.read_parquet(f"{path}/tang/subsample-20k.parquet")
 
 # Load corpus by corpus, not a recursively globbed panel: the two subsamples repeat rows.
@@ -67,50 +67,53 @@ replay = pl.read_parquet(f"{path}/replay_igh/pcps.parquet")
 
 Use the subsamples for repeatable reduced-cost Tang/Wyatt benchmarks and `pcps.parquet` for the whole corpus. These are evaluation PCPs, not a train/eval/test split.
 
-**Repeat the source comparison.** In a Python environment with DuckDB, download only `https://zenodo.org/api/records/17353498/files/pcps.tar.gz/content`; set `root` to this downloaded Hub dataset and `archive` to that verified archive. This is the same typed read used by the build, without repository code:
+**Repeat the source comparison.** In a Python environment with DuckDB, download only `https://zenodo.org/api/records/17353498/files/pcps.tar.gz/content`; set `root` to this downloaded Hub dataset and `archive` to that verified archive. The snippet extracts each CSV to a temporary file rather than using DuckDB's version-dependent in-memory BLOB reader. It declares the CSV's leading unnamed pandas index as the physical `column0` field, then selects only the published 19 columns. This is the same typed comparison as the build, without repository code:
 
 ```python
-import hashlib, json, tarfile
+import hashlib, json, tarfile, tempfile
 from pathlib import Path
 import duckdb
 import polars as pl
 
 root, archive = Path(root), Path(archive)
 declared = {
+    "column0": "BIGINT",  # The deposit's leading unnamed pandas index.
     "branch_length": "DOUBLE", "depth": "BIGINT", "distance": "DOUBLE",
     "cdr1_codon_start": "BIGINT", "cdr1_codon_end": "BIGINT",
     "cdr2_codon_start": "BIGINT", "cdr2_codon_end": "BIGINT",
     "cdr3_codon_start": "BIGINT", "cdr3_codon_end": "BIGINT",
     "parent_is_naive": "BOOLEAN", "child_is_leaf": "BOOLEAN",
 }
-# DuckDB names the leading empty-header integer index column0 for an in-memory CSV.
-# It is declared for row alignment but excluded from the published 19-column table.
-declared["column0"] = "BIGINT"
 meta = json.loads(pl.read_parquet(root / "provenance.parquet")["provenance_json"][0])
 assert hashlib.sha256(archive.read_bytes()).hexdigest() == meta["source"]["sha256"]
-# Text fields are declared VARCHAR. Python repr produces DuckDB-valid quoted identifiers and SQL types here.
+columns = meta["conversion"]["columns"]
+# Declare all 20 physical CSV fields, then select only the 19 published PCP columns.
 declarations = ", ".join(repr(c) + ": " + repr(declared.get(c, "VARCHAR"))
-                         for c in meta["conversion"]["columns"])
-with tarfile.open(archive, "r:gz") as tar, duckdb.connect() as db:
-    members = {m.name: m for m in tar.getmembers()}
-    for corpus, source in meta["corpora"].items():
-        csv_bytes = tar.extractfile(members[source["source_member"]]).read()
-        assert hashlib.sha256(csv_bytes).hexdigest() == source["source_sha256"]
-        selected = ", ".join('"' + c + '"' for c in meta["conversion"]["columns"])
-        expected = db.sql(
-            f"SELECT {selected} FROM read_csv(?::BLOB, header=true, all_varchar=true, columns={{{declarations}}})",
-            params=(csv_bytes,),
-        ).fetch_arrow_table().combine_chunks()
-        actual = db.read_parquet(str(root / corpus / "pcps.parquet")).fetch_arrow_table().combine_chunks()
-        assert actual.schema == expected.schema and actual.equals(expected)
-        print(f"{corpus}: all {source['source_rows']} ordered rows and values match")
+                         for c in ["column0"] + columns)
+selected = ", ".join('"' + c + '"' for c in columns)
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    with tarfile.open(archive, "r:gz") as tar, duckdb.connect() as db:
+        members = {m.name: m for m in tar.getmembers()}
+        for corpus, source in meta["corpora"].items():
+            csv_bytes = tar.extractfile(members[source["source_member"]]).read()
+            assert hashlib.sha256(csv_bytes).hexdigest() == source["source_sha256"]
+            csv_path = tmp / f"{corpus}.csv"
+            csv_path.write_bytes(csv_bytes)
+            expected = db.sql(
+                f"SELECT {selected} FROM read_csv(?, header=true, all_varchar=true, "
+                f"columns={{{declarations}}})", params=(str(csv_path),),
+            ).to_arrow_table().combine_chunks()
+            actual = db.read_parquet(str(root / corpus / "pcps.parquet")).to_arrow_table().combine_chunks()
+            assert actual.schema == expected.schema and actual.equals(expected)
+            print(f"{corpus}: all {source['source_rows']} ordered rows and values match")
 ```
 
 The build ran this complete row-and-value comparison as its conversion check; the separate recipe test checks the standalone outputs and independently redraws both subsamples from them.
 
 ## Recipe
 
-**Source:** the EPAM deposit, Zenodo record 17353498 (DOI `10.5281/zenodo.17353498`, CC BY 4.0), member `pcps.tar.gz`, pulled 2026-11-24:
+**Source:** Johnson et al., "Nucleotide context models outperform protein language models for predicting antibody affinity maturation," *PLOS Computational Biology* 2025 (DOI `10.1371/journal.pcbi.1013758`), and its Zenodo deposit, record 17353498 (DOI `10.5281/zenodo.17353498`, CC BY 4.0), member `pcps.tar.gz`, pulled 2026-11-24:
 
 - URL `https://zenodo.org/api/records/17353498/files/pcps.tar.gz/content`;
 - 54,015,727 bytes, MD5 `c9f5a5798e4a387b14a66a27f97c1acf` (Zenodo's checksum), SHA-256 `73f94dff6912b1e4e6872c9c952e4c3a10c06c4a209e47a765dbc34f5bea532c`;
