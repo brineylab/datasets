@@ -82,6 +82,9 @@ declared = {
     "cdr3_codon_start": "BIGINT", "cdr3_codon_end": "BIGINT",
     "parent_is_naive": "BOOLEAN", "child_is_leaf": "BOOLEAN",
 }
+# DuckDB names the leading empty-header integer index column0 for an in-memory CSV.
+# It is declared for row alignment but excluded from the published 19-column table.
+declared["column0"] = "BIGINT"
 meta = json.loads((root / "provenance.json").read_text())
 assert hashlib.sha256(archive.read_bytes()).hexdigest() == meta["source"]["sha256"]
 # Text fields are declared VARCHAR. Python repr produces DuckDB-valid quoted identifiers and SQL types here.

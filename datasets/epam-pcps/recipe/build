@@ -99,6 +99,7 @@ def main():
             "container": "CSV to parquet, without filtering, cleaning or reordering",
             "columns": COLUMNS,
             "duckdb_csv_reader": {"header": True, "types": NUMERIC,
+                                  "blob_generated_index_type": {"column0": "BIGINT"},
                                   "all_other_columns": "VARCHAR", "csv_empty_or_na_cell_as_null": True},
             "verification": "Every value in every ordered row and the parsed datatype equals a fresh typed read of its source CSV.",
         },

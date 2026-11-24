@@ -41,6 +41,9 @@ def csv_source(db, path_or_blob):
     declared = ", ".join(repr(c) + ": " + repr(NUMERIC.get(c, "VARCHAR")) for c in COLUMNS)
     selected = ", ".join('"' + c + '"' for c in COLUMNS)
     if isinstance(path_or_blob, bytes):
+        # With a BLOB, DuckDB names the leading empty-header column column0. Declare
+        # that physical INTEGER field too, then select only the 19 published PCP fields.
+        declared = "'column0': 'BIGINT', " + declared
         return db.sql(f"SELECT {selected} FROM read_csv(?::BLOB, header = true, all_varchar = true, "
                       f"columns = {{{declared}}})", params=(path_or_blob,))
     options = f"types = {{{', '.join(repr(c) + ': ' + repr(NUMERIC.get(c, 'VARCHAR')) for c in COLUMNS)}}}"
