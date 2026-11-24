@@ -12,6 +12,7 @@ import tarfile
 from pathlib import Path
 
 import duckdb
+import polars as pl
 
 
 def read_csv(db, data, columns, types):
@@ -26,7 +27,7 @@ def read_csv(db, data, columns, types):
 
 def main():
     out, archive = Path(sys.argv[1]), Path(sys.argv[2])
-    provenance = json.loads((out / "provenance.json").read_text(encoding="utf-8"))
+    provenance = json.loads(pl.read_parquet(out / "provenance.parquet")["provenance_json"][0])
     types = provenance["conversion"]["duckdb_csv_reader"]["types"]
     columns = provenance["conversion"]["columns"]
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == provenance["source"]["sha256"]

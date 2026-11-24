@@ -2,7 +2,7 @@
 name: epam-pcps
 description: "The six EPAM parent-child-pair corpora (FlAIRR, RACE, Tang, Wyatt/Jaffe, and Replay IGH/IGK) as ordered parquet, with one canonical whole-clonal-family 20,000-pair-target subsample each of Tang and Wyatt. Reach for it to evaluate antibody-evolution models on identical EPAM inputs without fetching and resampling the deposit independently."
 metadata:
-  version: 1.0.0
+  version: 1.0.1
   tools: datascience@1.2.0
   license: cc-by-4.0
   count: 743080
@@ -10,7 +10,7 @@ metadata:
 ---
 # epam-pcps
 
-Hub: `brineylab/epam-pcps`, tag `v1.0.0`
+Hub: `brineylab/epam-pcps`, tag `v1.0.1`
 
 EPAM (Sung et al., *PLOS Computational Biology* 2025; the deposit credits Johnson et al.) evaluates the real parent-to-child step of antibody somatic hypermutation. One row here is one parent-child pair (PCP), carrying the parent and observed-child BCR nucleotide sequences and their clonal-family annotations. The six-corpora total is 743,080 PCPs; the subsamples are views of already-counted rows.
 
@@ -58,7 +58,7 @@ This draw is new: it does not reproduce campaign `aa191851` (seed 0) or `c8eae86
 from huggingface_hub import snapshot_download
 import polars as pl
 
-path = snapshot_download("brineylab/epam-pcps", repo_type="dataset", revision="v1.0.0")
+path = snapshot_download("brineylab/epam-pcps", repo_type="dataset", revision="v1.0.1")
 tang = pl.read_parquet(f"{path}/tang/subsample-20k.parquet")
 
 # Load corpus by corpus, not a recursively globbed panel: the two subsamples repeat rows.
