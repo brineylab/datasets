@@ -267,7 +267,8 @@ def assemble(source, config, work, dest):
                     inventory_sha256=digest("\n".join(sorted(rows)).encode()),
                     summary_columns=table.column_names,
                     samples=samples, shards=shards)
-    (dest / "_snapshot.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    snapshot = pa.table({"manifest": [json.dumps(manifest, indent=2, sort_keys=True)]})
+    pq.write_table(snapshot, dest.parent / "_snapshot.parquet", compression="zstd")
     print(f"Built {len(rows)} instances in {len(shards)} shards; {len(samples)} CIF samples catalogued")
 
 

@@ -4,6 +4,31 @@
 # version, so adding or correcting them needs no new version.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-git diff --name-only -I '^  (count|unit):' "$@" -- datasets/ | cut -d/ -f2 | sort -u | while read -r d; do
-  if [[ -d "datasets/$d" ]]; then echo "$d"; fi
+# git diff -I also considers hunk-header context; YAML's --- marker makes that unreliable.
+git diff --unified=0 "$@" -- datasets/ | python3 -I -c '
+import re
+import sys
+
+path = None
+changed = []
+body = False
+for line in sys.stdin:
+    if line.startswith("diff --git "):
+        if path and body:
+            changed.append(path)
+        path = line.rsplit(" b/datasets/", 1)[-1].rstrip("\n").split("/", 1)[0] if " b/datasets/" in line else None
+        body = False
+    elif line.startswith("@@") or line.startswith(("+++", "---", "index ", "old mode ", "new mode ", "similarity ", "rename ", "deleted file ", "new file ", "Binary files ", "GIT binary patch", "\\ No newline")):
+        continue
+    elif line.startswith(("+", "-")):
+        if not re.match(r"^[+-]  (count|unit):", line):
+            body = True
+    else:
+        body = True
+if path and body:
+    changed.append(path)
+for name in sorted(set(changed)):
+    print(name)
+' | while read -r d; do
+    if [[ -d "datasets/$d" ]]; then echo "$d"; fi
 done

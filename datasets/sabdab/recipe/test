@@ -14,7 +14,10 @@ from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 
 def verify(directory, config=None):
     data = directory / "data"
-    manifest = json.loads((data / "_snapshot.json").read_text())
+    snapshot = pq.read_table(directory / "_snapshot.parquet")
+    if snapshot.num_rows != 1 or snapshot.column_names != ["manifest"]:
+        raise ValueError("snapshot manifest must be one row with a manifest column")
+    manifest = json.loads(snapshot["manifest"][0].as_py())
     if config:
         for key in ("last_update", "summary_sha256"):
             if config[key] and config[key] != manifest[key]:
