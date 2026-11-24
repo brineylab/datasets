@@ -3,22 +3,22 @@ dataset: sabdab
 version: 1.0.0
 hub: brineylab/sabdab
 branch: candidate-be4efb91576faff78bff68ee9f9815475e1386e1
-commit: 45c7492a1ab02f5427069a1f9ad5135b560d791e
+commit: bfa9f41ccfd4d38ac8766da132d2a75a69103f73
 tree: be4efb91576faff78bff68ee9f9815475e1386e1
 tools: datascience@1.2.0
 runner: sbatch --partition=cpu --cpus-per-task=16 --mem=128G --time=24:00:00
 host: bcr.scripps.edu
-started: 2026-11-24T06:08:01Z
+started: 2026-11-24T07:43:19Z
 exit: 0
 ---
 pyxis: importing docker image: ghcr.io#brineylab/toolshed/datascience:1.2.0
 pyxis: imported docker image: ghcr.io#brineylab/toolshed/datascience:1.2.0
 Built 22866 instances in 5 shards; 7 CIF samples catalogued
 22866 unique instances, 5 shards, 7 CIF samples verified
-file _snapshot.parquet 10929 765f989ec58822150dc823f305e5b09b58ba0e1e1873d82dbe11ddb04e361fb2
+file _snapshot.parquet 10928 5777864ee645e543bcabd5d610f450d33343aa8879e5b43fa75f517625c7aee9
 file data/00000.parquet 612942860 22a315f9f02ede63e24da2d8a009792e007df8e39df63db5b2c54b1425c372af
 file data/00001.parquet 578447856 07908b598b683b20d35434add767b88d5baf685457ff06fbcba64c8ff6e7bd43
 file data/00002.parquet 569403365 433631d8d307080d825a2a46f23d6db4c396e570be995a52f929422e25d74ab3
 file data/00003.parquet 579425615 41c54955fb9b7617a6aad482867ad30c4d46ab5eca1e4fce3398a514cbbed9ae
 file data/00004.parquet 279017632 1d88b02f03f320391a14a63f9ec1d8eb20e8891267870a92c43af3dc9b6013aa
-commit: 45c7492a1ab02f5427069a1f9ad5135b560d791e
+commit: bfa9f41ccfd4d38ac8766da132d2a75a69103f73
