@@ -8,6 +8,8 @@ from pathlib import Path
 
 import polars as pl
 
+# python3 -I excludes the script's directory, so add the local recipe module explicitly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import COLUMNS, CORPORA, NUMERIC, subsample
 
 params = tomllib.loads((Path(__file__).parent / "params.toml").read_text())
