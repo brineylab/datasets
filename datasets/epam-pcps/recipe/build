@@ -18,8 +18,8 @@ import duckdb
 import polars as pl
 import pyarrow.parquet as pq
 
-# Existing lab recipes include their local directory on sys.path. Explicitly add it
-# too, so both ordinary invocation and programmatic recipe runners behave identically.
+# Do not create __pycache__ beside the recipe: push checks that this tree is unchanged.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import COLUMNS, CORPORA, NUMERIC, csv_source, subsample
 

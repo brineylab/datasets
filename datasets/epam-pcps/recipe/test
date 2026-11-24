@@ -8,7 +8,8 @@ from pathlib import Path
 
 import polars as pl
 
-# python3 -I excludes the script's directory, so add the local recipe module explicitly.
+# python3 -I excludes the script's directory; bytecode would alter push's checked tree.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import COLUMNS, CORPORA, NUMERIC, subsample
 
