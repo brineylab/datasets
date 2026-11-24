@@ -22,14 +22,14 @@ race/pcps.parquet
 tang/pcps.parquet              tang/subsample-20k.parquet
 wyatt/pcps.parquet             wyatt/subsample-20k.parquet
 replay_igh/pcps.parquet        replay_igk/pcps.parquet
-provenance.json                source identity, every published file's sha256 and rows, and the exact subsample declaration
+provenance.parquet             one string column, `provenance_json`; its document holds source identity, data-file sha256/rows, and the exact subsample declaration
 ```
 
-Only Tang and Wyatt have subsamples; the four smaller corpora are used whole. Every parquet has the deposit's original rows, in source order, and the same ordered 19 columns:
+Only Tang and Wyatt have subsamples; the four smaller corpora are used whole. The eight corpus/subsample parquet files have the deposit's original rows, in source order, and the same ordered 19 columns:
 
 `sample_id`, `family` (clonal family within a sample), `parent_name`, `parent`, `child_name`, `child` (BCR nucleotide sequences), `branch_length`, `depth`, `distance`, `v_gene`, `j_gene`, `cdr1_codon_start`, `cdr1_codon_end`, `cdr2_codon_start`, `cdr2_codon_end`, `cdr3_codon_start`, `cdr3_codon_end`, `parent_is_naive`, `child_is_leaf`.
 
-`branch_length` and `distance` are float64; `depth` and the six codon-boundary fields are int64; the two flags are booleans; the other nine columns are strings. The deposit's CSVs have a leading unnamed pandas row-index column; the parquet conversion excludes that index and reads all 19 named PCP columns unchanged. Values are read with DuckDB's ordinary CSV parsing (including its ordinary missing-value handling), without filtering, cleaning, or reordering. `provenance.json` carries this reader declaration, every file's sha256 and row count, and each corpus's source archive member and sha256.
+`branch_length` and `distance` are float64; `depth` and the six codon-boundary fields are int64; the two flags are booleans; the other nine columns are strings. The deposit's CSVs have a leading unnamed pandas row-index column; the parquet conversion excludes that index and reads all 19 named PCP columns unchanged. Values are read with DuckDB's ordinary CSV parsing (including its ordinary missing-value handling), without filtering, cleaning, or reordering. `provenance.parquet` carries this reader declaration, every data parquet's sha256 and row count, and each corpus's source archive member and sha256. Its JSON text is stored in one `provenance_json` string cell so the Hub's parquet LFS storage lets the repository verify this file's bytes too.
 
 | Corpus | Rows | Species / locus | Source study and source CSV sha256 | Known training-data overlap |
 |---|---:|---|---|---|
@@ -48,7 +48,7 @@ The CSVs themselves are **not published**; their checksums are acceptance checks
 f"{seed}:{len(sample_id)}:{sample_id}{len(family)}:{family}"
 ```
 
-where the length is in Unicode characters, seed and lengths are ordinary decimal strings, and the whole string is encoded UTF-8. Seed `20261124`, target 20,000 PCPs. Walk this hash order and add each complete family while the total is below the target; if adding a family crosses it, retain that family whole and stop. Never trim pairs to 20,000. Within each subsample, rows remain in the original corpus's order. An actual full-hash collision would stop the draw. Every selected family, its measured overshoot, and the file checksum are checked by the recipe test and recorded in `provenance.json`.
+where the length is in Unicode characters, seed and lengths are ordinary decimal strings, and the whole string is encoded UTF-8. Seed `20261124`, target 20,000 PCPs. Walk this hash order and add each complete family while the total is below the target; if adding a family crosses it, retain that family whole and stop. Never trim pairs to 20,000. Within each subsample, rows remain in the original corpus's order. An actual full-hash collision would stop the draw. Every selected family, its measured overshoot, and the file checksum are checked by the recipe test and recorded in `provenance.parquet`.
 
 This draw is new: it does not reproduce campaign `aa191851` (seed 0) or `c8eae861` (seed 20261120), which used different and partly unrecorded procedures. Those older tables remain traceable but are not presented as pairwise comparable. In the full corpora, composite family keys give Tang 142,857 families and Wyatt 50,692; `family` alone would incorrectly merge them into 43,692 and 49,206 groups respectively.
 
@@ -73,6 +73,7 @@ Use the subsamples for repeatable reduced-cost Tang/Wyatt benchmarks and `pcps.p
 import hashlib, json, tarfile
 from pathlib import Path
 import duckdb
+import polars as pl
 
 root, archive = Path(root), Path(archive)
 declared = {
@@ -85,7 +86,7 @@ declared = {
 # DuckDB names the leading empty-header integer index column0 for an in-memory CSV.
 # It is declared for row alignment but excluded from the published 19-column table.
 declared["column0"] = "BIGINT"
-meta = json.loads((root / "provenance.json").read_text())
+meta = json.loads(pl.read_parquet(root / "provenance.parquet")["provenance_json"][0])
 assert hashlib.sha256(archive.read_bytes()).hexdigest() == meta["source"]["sha256"]
 # Text fields are declared VARCHAR. Python repr produces DuckDB-valid quoted identifiers and SQL types here.
 declarations = ", ".join(repr(c) + ": " + repr(declared.get(c, "VARCHAR"))
@@ -115,11 +116,11 @@ The build ran this complete row-and-value comparison as its conversion check; th
 - 54,015,727 bytes, MD5 `c9f5a5798e4a387b14a66a27f97c1acf` (Zenodo's checksum), SHA-256 `73f94dff6912b1e4e6872c9c952e4c3a10c06c4a209e47a765dbc34f5bea532c`;
 - exactly ten archive members: six source CSVs and four directory entries. No other deposit member is fetched.
 
-The archive and each source CSV must match its pinned byte count/digest exactly before conversion. The six source filenames and sha256 values are fixed in `recipe/common.py` and mirrored in `provenance.json`.
+The archive and each source CSV must match its pinned byte count/digest exactly before conversion. The six source filenames and sha256 values are fixed in `recipe/common.py` and mirrored in `provenance.parquet`.
 
-**Steps**, one CPU job in `datascience@1.2.0`: verify the archive, read the six CSVs using the declared DuckDB types, write zstd-compressed parquet, compare every ordered value and datatype with a fresh typed read of its source, then draw the two canonical subsamples once from the successfully converted corpora and write them. Write `provenance.json` with the source provenance, ordered-row comparison declaration, subsample seed/key/order/accumulation and crossing-family rules, subsample rows/families/overshoot, and all published file rows and sha256. The archive and verified source snapshots remain under `<out>/.work/` and are not uploaded.
+**Steps**, one CPU job in `datascience@1.2.0`: verify the archive, read the six CSVs using the declared DuckDB types, write zstd-compressed parquet, compare every ordered value and datatype with a fresh typed read of its source, then draw the two canonical subsamples once from the successfully converted corpora and write them. Write `provenance.parquet` with the source provenance, ordered-row comparison declaration, subsample seed/key/order/accumulation and crossing-family rules, subsample rows/families/overshoot, and all eight corpus/subsample file rows and sha256. The archive and verified source snapshots remain under `<out>/.work/` and are not uploaded.
 
-**The test** checks the eight parquet file names and `provenance.json`, exact corpus rows and 743,080 total, string-column and ordered numeric/boolean schemas, all published-file rows and sha256 in the manifest, source CSV sha256 provenance, Tang/Wyatt composite-family counts versus incorrect family-only counts, complete-family membership, and an independent exact redraw of every subsample row in original order.
+**The test** checks the eight parquet file names and `provenance.parquet`, exact corpus rows and 743,080 total, string-column and ordered numeric/boolean schemas, all corpus/subsample-file rows and sha256 in the manifest, source CSV sha256 provenance, Tang/Wyatt composite-family counts versus incorrect family-only counts, complete-family membership, and an independent exact redraw of every subsample row in original order.
 
 ## Compute
 
@@ -129,7 +130,7 @@ One CPU-only job in datascience, 16 CPUs and 16 GB requested. Only the pinned 54
 
 - **One panel by PI decision (ngk5, 2026-11-24), not split under design rule D3.** Four human and two mouse evaluation corpora share one recipe identity (one archive at one pull date), rather than being recipe-parameter variants. Splitting this panel would recreate version drift; use explicit corpus paths instead.
 - **Do not use `family` as the global family key.** It repeats across samples. `(sample_id, family)` is the sampling and family-completeness unit.
-- The subsample is not exactly 20,000 rows: the crossing family is retained whole. Consult `provenance.json` for the measured result.
+- The subsample is not exactly 20,000 rows: the crossing family is retained whole. Consult `provenance.parquet` for the measured result.
 - Contamination notes describe known EPAM comparisons, not a universal contamination screen. Tang partly overlaps AbLang2; Wyatt/Jaffe overlaps AbLang2 and Thrifty-prod. Absence of a listed overlap is not evidence of universal independence.
 - Subsamples repeat rows from full-corpus parquet files. Never count both when counting corpus PCPs.
 - Only `pcps.tar.gz` is needed or permitted by this recipe. Do not retrieve the deposit's very large `aaprobs.tar.gz`, `dataframes_and_tables.tar.gz`, or `models_setup.tar.gz`.

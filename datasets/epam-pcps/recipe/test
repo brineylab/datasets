@@ -18,7 +18,11 @@ out = Path(sys.argv[1])
 problems = []
 total = 0
 try:
-    provenance = json.loads((out / "provenance.json").read_text(encoding="utf-8"))
+    provenance_path = out / "provenance.parquet"
+    provenance_text = pl.read_parquet(provenance_path)["provenance_json"][0]
+    provenance = json.loads(provenance_text)
+    provenance_digest = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
+    print(f"provenance.parquet 1 row sha256 {provenance_digest}")
     if provenance["source"]["sha256"] != params["source_sha256"]:
         problems.append("provenance: source sha256 differs from the pinned archive")
     if provenance["subsample"]["seed"] != params["seed"] or set(provenance["subsample"]["corpora"]) != set(params["subsample_corpora"]):

@@ -143,9 +143,16 @@ def main():
             print(f"subsample {corpus}: {total} rows, {families} families, target {params['subsample_target']}, "
                   f"overshoot {overshoot}, seed {params['seed']}, family key (sample_id, family), file sha256 {sha256(sample_path)}")
     assert sum(c["rows"] for k, c in manifest["files"].items() if k.endswith("/pcps.parquet")) == 743080
-    part = out / "provenance.json.part"
-    part.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    part.replace(out / "provenance.json")
+    # Keep the JSON manifest as a string in parquet: the Hub stores parquet in LFS,
+    # so the record can verify every published file's sha256.
+    # The Hub keeps JSON outside LFS while this repository checks sha256 through LFS.
+    # Store the JSON text in a small parquet column so every published file is verifiable.
+    provenance_path = out / "provenance.parquet"
+    part = out / "provenance.parquet.part"
+    pl.DataFrame({"provenance_json": [json.dumps(manifest, indent=2) + "\n"]}).write_parquet(
+        part, compression="zstd"
+    )
+    part.replace(provenance_path)
 
 
 if __name__ == "__main__":
