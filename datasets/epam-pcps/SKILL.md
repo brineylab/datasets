@@ -29,7 +29,7 @@ Only Tang and Wyatt have subsamples; the four smaller corpora are used whole. Ev
 
 `sample_id`, `family` (clonal family within a sample), `parent_name`, `parent`, `child_name`, `child` (BCR nucleotide sequences), `branch_length`, `depth`, `distance`, `v_gene`, `j_gene`, `cdr1_codon_start`, `cdr1_codon_end`, `cdr2_codon_start`, `cdr2_codon_end`, `cdr3_codon_start`, `cdr3_codon_end`, `parent_is_naive`, `child_is_leaf`.
 
-`branch_length` and `distance` are float64; `depth` and the six codon-boundary fields are int64; the two flags are booleans; the other nine columns are strings. Values are read unchanged with DuckDB's ordinary CSV parsing (including its ordinary missing-value handling), without filtering, cleaning, or reordering. `provenance.json` carries this reader declaration, every file's sha256 and row count, and each corpus's source archive member and sha256.
+`branch_length` and `distance` are float64; `depth` and the six codon-boundary fields are int64; the two flags are booleans; the other nine columns are strings. The deposit's CSVs have a leading unnamed pandas row-index column; the parquet conversion excludes that index and reads all 19 named PCP columns unchanged. Values are read with DuckDB's ordinary CSV parsing (including its ordinary missing-value handling), without filtering, cleaning, or reordering. `provenance.json` carries this reader declaration, every file's sha256 and row count, and each corpus's source archive member and sha256.
 
 | Corpus | Rows | Species / locus | Source study and source CSV sha256 | Known training-data overlap |
 |---|---:|---|---|---|
@@ -92,8 +92,9 @@ with tarfile.open(archive, "r:gz") as tar, duckdb.connect() as db:
     for corpus, source in meta["corpora"].items():
         csv_bytes = tar.extractfile(members[source["source_member"]]).read()
         assert hashlib.sha256(csv_bytes).hexdigest() == source["source_sha256"]
+        selected = ", ".join('"' + c + '"' for c in meta["conversion"]["columns"])
         expected = db.sql(
-            f"read_csv(?::BLOB, header=true, all_varchar=true, columns={{{declarations}}})",
+            f"SELECT {selected} FROM read_csv(?::BLOB, header=true, all_varchar=true, columns={{{declarations}}})",
             params=(csv_bytes,),
         ).fetch_arrow_table().combine_chunks()
         actual = db.read_parquet(str(root / corpus / "pcps.parquet")).fetch_arrow_table().combine_chunks()

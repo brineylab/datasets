@@ -37,13 +37,14 @@ CORPORA = {
 
 
 def csv_source(db, path_or_blob):
-    """One typed CSV read for both the build and the reproducibility helper."""
+    """Read the 19 PCP fields, excluding the deposit's unnamed pandas index column."""
+    declared = ", ".join(repr(c) + ": " + repr(NUMERIC.get(c, "VARCHAR")) for c in COLUMNS)
+    selected = ", ".join('"' + c + '"' for c in COLUMNS)
     if isinstance(path_or_blob, bytes):
-        declared = ", ".join(repr(c) + ": " + repr(NUMERIC.get(c, "VARCHAR")) for c in COLUMNS)
-        return db.sql(f"read_csv(?::BLOB, header = true, all_varchar = true, columns = {{{declared}}})",
-                      params=(path_or_blob,))
+        return db.sql(f"SELECT {selected} FROM read_csv(?::BLOB, header = true, all_varchar = true, "
+                      f"columns = {{{declared}}})", params=(path_or_blob,))
     options = f"types = {{{', '.join(repr(c) + ': ' + repr(NUMERIC.get(c, 'VARCHAR')) for c in COLUMNS)}}}"
-    return db.sql(f"SELECT * FROM read_csv(?, header = true, {options})", params=(str(path_or_blob),))
+    return db.sql(f"SELECT {selected} FROM read_csv(?, header = true, {options})", params=(str(path_or_blob),))
 
 
 def family_order_key(seed, sample_id, family):

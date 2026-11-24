@@ -17,8 +17,9 @@ import duckdb
 def read_csv(db, data, columns, types):
     """A typed, in-memory source read; all unspecified columns are text."""
     declarations = ", ".join(repr(c) + ": " + repr(types.get(c, "VARCHAR")) for c in columns)
-    return db.sql(f"read_csv(?::BLOB, header = true, all_varchar = true, columns = {{{declarations}}})",
-                  params=(data,))
+    selected = ", ".join('"' + c + '"' for c in columns)
+    return db.sql(f"SELECT {selected} FROM read_csv(?::BLOB, header = true, all_varchar = true, "
+                  f"columns = {{{declarations}}})", params=(data,))
 
 
 def main():

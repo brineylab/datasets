@@ -115,7 +115,8 @@ def main():
     }
     for corpus, (member, expected_rows, digest) in CORPORA.items():
         path = out / corpus / "pcps.parquet"
-        if not path.is_file() or pq.ParquetFile(path).metadata.num_rows != expected_rows:
+        if not path.is_file() or (pq.ParquetFile(path).metadata.num_rows != expected_rows
+                                  or pq.ParquetFile(path).schema_arrow.names != COLUMNS):
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name("pcps.parquet.part")
             con = duckdb.connect()
