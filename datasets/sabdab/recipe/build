@@ -285,6 +285,7 @@ def main(out):
             dest.mkdir()
             assemble(Source(config["api"]), config, work, dest)
             os.rename(dest, out / "data")
+            os.rename(dest.parent / "_snapshot.parquet", out / "_snapshot.parquet")
 
 
 if __name__ == "__main__":
