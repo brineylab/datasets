@@ -107,12 +107,9 @@ def assemble(source, config, work, dest):
     if set(extras).intersection(table.column_names):
         raise ValueError("Upstream column collides with a derived field")
     schema = pa.schema([*table.schema, *(pa.field(k, v) for k, v in extras.items())])
-    filenames = {}
-    for idx, row in enumerate(rows.values()):
-        stem = "_".join([row["PDB_ID"], row["Hchain"] or "+", row["Lchain"] or "+"])
-        if stem in filenames:
-            raise ValueError(f"Two instances map to the same crop: {stem}")
-        filenames[stem] = (idx, row)
+    indexes = {key: idx for idx, key in enumerate(rows)}
+    pending = set(rows)
+    crop_instances = None
     counts = Counter(r["PDB_ID"] for r in rows.values())
     samples, categories, shards = {}, set(), []
     repeated = next((pdb for pdb, n in counts.items() if n > 1), None)
@@ -128,10 +125,14 @@ def assemble(source, config, work, dest):
                     continue
                 if path.name.lower() == "sabdab_summary.csv":
                     archive_rows = inventory(tar.extractfile(member).read())
-                    # This path is export bookkeeping, not a SAbDab2 summary annotation.
-                    archive_rows = {key: {name: value for name, value in row.items()
-                                          if name != "filename_in_archive"}
-                                    for key, row in archive_rows.items()}
+                    # Case-colliding filenames get numeric suffixes; this is the source's authoritative join.
+                    crop_instances = {}
+                    for key, row in archive_rows.items():
+                        name = PurePosixPath(row.pop("filename_in_archive") or "")
+                        if (str(name) != "instance_structures/" + name.name or
+                                not name.name.endswith(".cif.gz") or str(name) in crop_instances):
+                            raise CropArchiveError(f"Missing, invalid or duplicate crop mapping for {key}: {name}")
+                        crop_instances[str(name)] = key
                     if have_summary or archive_rows != rows:
                         only_archive = sorted(set(archive_rows) - set(rows))
                         only_summary = sorted(set(rows) - set(archive_rows))
@@ -152,13 +153,17 @@ def assemble(source, config, work, dest):
                     continue
                 if path.parent.name != "instance_structures" or not path.name.endswith(".cif.gz"):
                     continue
-                stem, variant = path.name.removesuffix(".cif.gz").rsplit("_", 1)
-                if stem not in filenames:
-                    raise CropArchiveError(f"Duplicate or unexpected instance crop: {path}")
-                idx, row = filenames.pop(stem)
-                key = row["INSTANCE"]
+                if crop_instances is None or str(path) not in crop_instances:
+                    raise CropArchiveError(f"Duplicate, unexpected or prematurely ordered instance crop: {path}")
+                key = crop_instances[str(path)]
+                if key not in pending:
+                    raise CropArchiveError(f"Duplicate instance crop: {path}")
+                pending.remove(key)
+                idx = indexes[key]
+                row = rows[key]
                 has_antigen = bool(row["antigen_chain"])
-                if variant != ("abag" if has_antigen else "ab"):
+                kind = path.name.removesuffix(".cif.gz").rsplit("_", 1)[-1]
+                if kind.rstrip("0123456789") != ("abag" if has_antigen else "ab"):
                     raise CropArchiveError(f"Incorrect antigen download option for {key}: {path}")
                 data = gzip.decompress(tar.extractfile(member).read())
                 if not data.lstrip().startswith(b"data_"):
@@ -198,8 +203,8 @@ def assemble(source, config, work, dest):
                         writer = None
             if batch:
                 writer.write_table(pa.Table.from_pylist(batch, schema=schema))
-        if filenames or not have_summary:
-            raise CropArchiveError(f"Missing archive summary or instance crops: {list(filenames)[:4]}")
+        if pending or not have_summary:
+            raise CropArchiveError(f"Missing archive summary or instance crops: {sorted(pending)[:4]}")
     except (CropArchiveError, tarfile.TarError, EOFError, gzip.BadGzipFile):
         archive.unlink(missing_ok=True)
         raise

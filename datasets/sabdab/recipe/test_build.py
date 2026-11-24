@@ -26,7 +26,8 @@ class Export:
         self.rows = []
         self.objects = {}
         self.files = {}
-        for i, (h, l, antigens) in enumerate([("A1", "A2", ["C", "D"]), (None, "E", [])]):
+        self.archive_names = {}
+        for i, (h, l, antigens) in enumerate([("H", "L", ["C", "D"]), ("h", "l", ["C", "D"]), (None, "E", [])]):
             pdb = "pdb_0000test"
             key = "-".join(c for c in (pdb, h, l) if c)
             ab = f"pair{i}"
@@ -34,7 +35,8 @@ class Export:
                               "LIGHT_ID": l, "Hchain": h, "Lchain": l, "CDR-H3": "A"*16 if h else None,
                               "antigen_chain": "|".join(antigens),
                               "heavy_taxid": 9606 if h else None, "extra_summary_column": "kept"})
-            name = f"{pdb}_{h or '+'}_{l}_{'abag' if antigens else 'ab'}.cif.gz"
+            name = f"{pdb}_{h or '+'}_{l}_{'abag' if antigens else 'ab'}{i + 1 if i < 2 else ''}.cif.gz"
+            self.archive_names[key] = name
             chains = " ".join(c for c in (h, l, *antigens) if c)
             self.files[name] = ("data_test\r\n_entry.id TEST\r\nloop_\r\n_atom_site.auth_asym_id\r\n" + chains + "\r\n").encode()
 
@@ -42,7 +44,7 @@ class Export:
         if path == "/stats/summary":
             self.state_reads += 1
             marker = "new" if self.case == "refresh" and self.state_reads > 1 else "initial"
-            return json.dumps(dict(last_update=marker, antibody_instances=2)).encode()
+            return json.dumps(dict(last_update=marker, antibody_instances=3)).encode()
         if path == "/download/all-summary":
             buf = io.StringIO()
             csvfile = csv.DictWriter(buf, self.rows[0])
@@ -63,7 +65,13 @@ class Export:
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
                 tar.addfile(info, io.BytesIO(data))
-            add("SAbDab_summary.csv", self.get("/download/all-summary"))
+            buf = io.StringIO()
+            fields = [*self.rows[0], "filename_in_archive"]
+            csvfile = csv.DictWriter(buf, fields)
+            csvfile.writeheader()
+            csvfile.writerows([{**row, "filename_in_archive": "instance_structures/" + self.archive_names[row["INSTANCE"]]}
+                               for row in self.rows])
+            add("SAbDab_summary.csv", buf.getvalue().encode())
             for i, (name, data) in enumerate(self.files.items()):
                 if self.case == "missing" and i == 0:
                     continue
@@ -82,11 +90,11 @@ class SnapshotTest(unittest.TestCase):
             source = Export()
             self.capture(root, source)
             verify(root)
-            a, b = pq.read_table(root / "data").to_pylist()
-            self.assertEqual([a["PDB_ID"], b["PDB_ID"]], [a["PDB"]]*2)
-            self.assertEqual([a["cdrh3_length_aa"], b["cdrh3_length_aa"]], [16, None])
-            self.assertEqual(a["extra_summary_column"], "kept")
-            self.assertEqual(a["cif"].encode(), next(iter(source.files.values())))
+            rows = pq.read_table(root / "data").to_pylist()
+            self.assertEqual([r["PDB_ID"] for r in rows], [rows[0]["PDB"]]*3)
+            self.assertEqual([r["cdrh3_length_aa"] for r in rows], [16, 16, None])
+            self.assertEqual([r["extra_summary_column"] for r in rows], ["kept"]*3)
+            self.assertEqual([r["cif"].encode() for r in rows], list(source.files.values()))
             with self.assertRaisesRegex(ValueError, "pinned last_update"):
                 verify(root, {"last_update": "another release", "summary_sha256": ""})
 
