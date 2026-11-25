@@ -6,7 +6,7 @@ Why it exists and what it is not: [docs/VISION.md](docs/VISION.md). How it works
 
 ## Finding a dataset
 
-`ls datasets`. Each `datasets/<name>/SKILL.md` starts with a `description` that says what the dataset is and when to reach for it, then its files and their columns, the line that reads it, the recipe that made it, and what the build took.
+Start with [CATALOG.md](CATALOG.md), the auto-generated index of every published dataset (version, entries, size, license, tools, Hub link, and description). Agents can read it from a local clone or in a single fetch from `https://raw.githubusercontent.com/brineylab/datasets/main/CATALOG.md`, then open a dataset's `datasets/<name>/SKILL.md` for its files, columns, loading line, recipe, and compute.
 
 ## Reading a dataset from anywhere
 

@@ -83,6 +83,19 @@ class CatalogTests(unittest.TestCase):
             self.assertIn(f"[{name}](datasets/{name}/SKILL.md)", row)
             self.assertEqual(row.replace(r"\|", "").count("|"), 8)  # 7 columns
 
+    def test_catalog_workflow_and_scripts_are_org_agnostic(self):
+        wf = ROOT / ".github" / "workflows" / "catalog.yml"
+        self.assertTrue(wf.is_file(), f"{wf} is missing")
+        catalog_wf = wf.read_text(encoding="utf-8")
+        catalog_py = (ROOT / "scripts" / "catalog.py").read_text(encoding="utf-8")
+        self.assertNotIn("brineylab", catalog_wf)
+        self.assertNotIn("brineylab", catalog_py)
+        for snippet in ("contents: write", "cancel-in-progress: false", "workflow_dispatch", "scripts/catalog.py --write", "datasets/*/SKILL.md"):
+            self.assertIn(snippet, catalog_wf)
+        pr_wf = (ROOT / ".github" / "workflows" / "datasets.yml").read_text(encoding="utf-8")
+        self.assertIn("contents: read", pr_wf)
+        self.assertNotIn("contents: write", pr_wf)
+
 
 if __name__ == "__main__":
     unittest.main()

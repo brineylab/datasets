@@ -1,0 +1,43 @@
+name: catalog
+
+# On GitHub's hosted runners only. Keeps CATALOG.md at the repository root current on push to main
+# without touching pull requests, so concurrent dataset PRs never conflict on a shared index.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'datasets/*/SKILL.md'
+      - 'results/*/*.txt'
+      - 'hub.toml'
+      - 'scripts/catalog.py'
+      - 'scripts/check.py'
+      - '.github/workflows/catalog.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: catalog
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - run: python3 -I scripts/catalog.py --write
+      - run: |
+          [[ -n "$(git status --porcelain CATALOG.md)" ]] || { echo "CATALOG.md is up to date"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CATALOG.md
+          git commit -m "Update CATALOG.md"
+          git push
