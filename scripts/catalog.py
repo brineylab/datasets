@@ -43,6 +43,10 @@ def escape_cell(text: str) -> str:
     return " ".join(text.split()).replace("|", r"\|")
 
 
+def _str(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def render_catalog(root: Path = check.ROOT) -> str:
     org = check.read_toml((root / "hub.toml").read_text(encoding="utf-8"))["org"]
     datasets_dir = root / "datasets"
@@ -55,23 +59,24 @@ def render_catalog(root: Path = check.ROOT) -> str:
             continue
         fm = check.frontmatter(skill)
         meta = fm.get("metadata")
-        if not isinstance(meta, dict) or not meta.get("version"):
+        version = _str(meta.get("version")) if isinstance(meta, dict) else ""
+        if not version:
             continue
         name = d.name
-        version = meta["version"]
         record_path = root / "results" / name / f"{version}.txt"
         if not record_path.is_file():
             continue
         rec = check.parse_record(record_path)
         if rec.get("exit") != 0:
             continue
-        count, unit = meta.get("count", ""), meta.get("unit", "")
-        entries = format_count(int(count), unit) if count.isdigit() and unit else "—"
+        count = _str(meta.get("count"))
+        unit = escape_cell(_str(meta.get("unit")))
+        entries = format_count(int(count), unit) if count.isascii() and count.isdigit() and unit else "—"
         files = rec.get("files", [])
         size = format_bytes(sum(sz for _, sz, _ in files)) if files else "—"
-        license_id = escape_cell(meta.get("license", "")) or "—"
-        tools = escape_cell(meta.get("tools", "")) or "—"
-        desc = escape_cell(fm.get("description", "")) or "—"
+        license_id = escape_cell(_str(meta.get("license"))) or "—"
+        tools = escape_cell(_str(meta.get("tools"))) or "—"
+        desc = escape_cell(_str(fm.get("description"))) or "—"
         rows.append(
             f"| [{name}](datasets/{name}/SKILL.md) "
             f"| [v{version}](https://huggingface.co/datasets/{org}/{name}/tree/v{version}) "

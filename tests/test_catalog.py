@@ -83,6 +83,24 @@ class CatalogTests(unittest.TestCase):
             self.assertIn(f"[{name}](datasets/{name}/SKILL.md)", row)
             self.assertEqual(row.replace(r"\|", "").count("|"), 8)  # 7 columns
 
+    def test_render_catalog_handles_non_string_fields_non_ascii_count_and_pipe_in_unit(self):
+        tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp)
+        (tmp / "hub.toml").write_text('org = "exampleorg"\ntoolshed = "ghcr.io/exampleorg/toolshed"\n')
+        for name, skill in (
+            ("weird", "---\nname: weird\ndescription:\n  nested: line\nmetadata:\n  version: 1.0.0\n  tools: datascience@1.2.0\n  license: mit\n  count: ²\n  unit: items\n---\n"),
+            ("piped", "---\nname: piped\ndescription: \"Ok.\"\nmetadata:\n  version: 1.0.0\n  tools: datascience@1.2.0\n  license: mit\n  count: 1200\n  unit: a | b\n---\n"),
+        ):
+            d = tmp / "datasets" / name; d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(skill, encoding="utf-8")
+            r = tmp / "results" / name; r.mkdir(parents=True)
+            (r / "1.0.0.txt").write_text(f"---\ndataset: {name}\nversion: 1.0.0\nexit: 0\n---\n", encoding="utf-8")
+        out = catalog.render_catalog(tmp)
+        rows = [line for line in out.splitlines() if line.startswith("| [")]
+        self.assertEqual(rows, [
+            r"| [piped](datasets/piped/SKILL.md) | [v1.0.0](https://huggingface.co/datasets/exampleorg/piped/tree/v1.0.0) | 1.20k a \| b | — | mit | datascience@1.2.0 | Ok. |",
+            "| [weird](datasets/weird/SKILL.md) | [v1.0.0](https://huggingface.co/datasets/exampleorg/weird/tree/v1.0.0) | — | — | mit | datascience@1.2.0 | — |",
+        ])
+
     def test_catalog_workflow_and_scripts_are_org_agnostic(self):
         wf = ROOT / ".github" / "workflows" / "catalog.yml"
         self.assertTrue(wf.is_file(), f"{wf} is missing")
@@ -90,7 +108,16 @@ class CatalogTests(unittest.TestCase):
         catalog_py = (ROOT / "scripts" / "catalog.py").read_text(encoding="utf-8")
         self.assertNotIn("brineylab", catalog_wf)
         self.assertNotIn("brineylab", catalog_py)
-        for snippet in ("contents: write", "cancel-in-progress: false", "workflow_dispatch", "scripts/catalog.py --write", "datasets/*/SKILL.md"):
+        for snippet in (
+            "contents: write",
+            "cancel-in-progress: false",
+            "workflow_dispatch",
+            "scripts/catalog.py --write",
+            "datasets/*/SKILL.md",
+            "if: github.ref == 'refs/heads/main'",
+            "ref: main",
+            "git reset --hard origin/main",
+        ):
             self.assertIn(snippet, catalog_wf)
         pr_wf = (ROOT / ".github" / "workflows" / "datasets.yml").read_text(encoding="utf-8")
         self.assertIn("contents: read", pr_wf)
