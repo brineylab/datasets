@@ -1,23 +1,23 @@
 ---
 dataset: epam-pcps
-version: 1.0.0
+version: 1.0.2
 hub: brineylab/epam-pcps
-branch: candidate-d0f24cb2a9e36e6e290b2879576176181630a9fc
-commit: f150e245cf9a1d7aa91d59a270edf08430585a40
-tree: d0f24cb2a9e36e6e290b2879576176181630a9fc
+branch: candidate-73807362100a6dc67f9e60f7fd59980815c945a6
+commit: fbe14f333ff62ac82c057c437ead867251323a72
+tree: 73807362100a6dc67f9e60f7fd59980815c945a6
 tools: datascience@1.2.0
-runner: sbatch --partition=cpu --cpus-per-task=16 --mem=16G --time=02:00:00
+runner: sbatch --partition=cpu --cpus-per-task=16 --mem=16G --time=00:45:00
 host: bcr.scripps.edu
-started: 2026-11-24T20:58:16Z
+started: 2026-11-24T23:57:26Z
 exit: 0
 ---
 pyxis: importing docker image: ghcr.io#brineylab/toolshed/datascience:1.2.0
 pyxis: imported docker image: ghcr.io#brineylab/toolshed/datascience:1.2.0
-/mnt/data/shared/flyloft/ngk5/epam-pcp-corpora/epam-pcp-corpora-as-a-dataset-82a268ef/runs/439292ad-7852-4d6b-930f-038bc887f4f1/code/datasets/epam-pcps/recipe/build:124: DeprecationWarning: fetch_arrow_table() is deprecated, use to_arrow_table() instead.
+/mnt/data/shared/flyloft/ngk5/epam-pcp-corpora/fix-epam-pcps-citation-and-verifier-7426c681/runs/fbab6449-e639-4029-a15e-0e272a1fe68b/code/datasets/epam-pcps/recipe/build:124: DeprecationWarning: fetch_arrow_table() is deprecated, use to_arrow_table() instead.
   table = csv_source(con, sources / corpus / "source.csv").fetch_arrow_table()
-/mnt/data/shared/flyloft/ngk5/epam-pcp-corpora/epam-pcp-corpora-as-a-dataset-82a268ef/runs/439292ad-7852-4d6b-930f-038bc887f4f1/code/datasets/epam-pcps/recipe/build:77: DeprecationWarning: fetch_arrow_table() is deprecated, use to_arrow_table() instead.
+/mnt/data/shared/flyloft/ngk5/epam-pcp-corpora/fix-epam-pcps-citation-and-verifier-7426c681/runs/fbab6449-e639-4029-a15e-0e272a1fe68b/code/datasets/epam-pcps/recipe/build:77: DeprecationWarning: fetch_arrow_table() is deprecated, use to_arrow_table() instead.
   comparison = con.read_parquet(str(parquet)).fetch_arrow_table().combine_chunks()
-/mnt/data/shared/flyloft/ngk5/epam-pcp-corpora/epam-pcp-corpora-as-a-dataset-82a268ef/runs/439292ad-7852-4d6b-930f-038bc887f4f1/code/datasets/epam-pcps/recipe/build:78: DeprecationWarning: fetch_arrow_table() is deprecated, use to_arrow_table() instead.
+/mnt/data/shared/flyloft/ngk5/epam-pcp-corpora/fix-epam-pcps-citation-and-verifier-7426c681/runs/fbab6449-e639-4029-a15e-0e272a1fe68b/code/datasets/epam-pcps/recipe/build:78: DeprecationWarning: fetch_arrow_table() is deprecated, use to_arrow_table() instead.
   expected = csv_source(con, source).fetch_arrow_table().combine_chunks()
 corpus flairr: 2798 rows, source sha256 3ee40a2db0f943d665e3ff0aebcbf18986e1259c6cfd89708bd8019d7d30a815, file sha256 d16ae551e7e29be3d2cee23a1e834da7eb4effe54aa0da2ef834703039af25b1
 corpus race: 20656 rows, source sha256 e92f20a68d88538839fa1dd89981bfec3bc3c2b50cb6ce888f24f66c48bce675, file sha256 c603b186ab1d9dbfdf14a28437ad29944e5c32abfcb14a06d116e0f792653200
@@ -46,4 +46,4 @@ file tang/pcps.parquet 37701660 c97dc6806280b6b31f18114fac792c3d5ae3d3eda46d36f1
 file tang/subsample-20k.parquet 1501830 81f42b959844cfb053b201dff1343dab8c3a0648c8a463fa5e05e941a9361d68
 file wyatt/pcps.parquet 15984188 ada17bef1a5ac6d44f4cf2dbedd10e8adf41910b7b7e80485b705b89cfa025de
 file wyatt/subsample-20k.parquet 1582923 5f02522a4ec57fcf32340d8472638f5b1b65f487024b0137007136d7a78075ad
-commit: f150e245cf9a1d7aa91d59a270edf08430585a40
+commit: fbe14f333ff62ac82c057c437ead867251323a72
