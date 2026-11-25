@@ -102,7 +102,7 @@ Any change under `datasets/<name>/` bumps `metadata.version`, prose included, ex
 
 ## The pull request
 
-1. Push your branch and open the pull request, the record committed in it.
+1. Push your branch and open the pull request, the record committed in it. Do not edit `CATALOG.md` in your pull request; CI updates it on `main` after merge.
 2. `check` runs: the dataset's rules, an unpublished version, each tool in the toolshed at its version, and a record of a passing test whose files the Hub holds exactly.
 3. Someone other than you reviews it, a critic agent included: does the skill describe the files the record lists and state the recipe's inputs; does the record show the test passed where the build ran; is the version new; are the tools the ones the record shows. They squash-merge it (`gh pr merge --squash`).
 4. Whoever merged promotes it: pull `main`, then, from the clone's root,
